@@ -11,12 +11,12 @@
 
 | 🎬 **Live Video Wallpaper Playback** | 📊 **Real-Time Performance Profiler HUD** |
 | :---: | :---: |
-| ![Preview 1 - Live Video Wallpaper Playback](preview1.png) | ![Preview 2 - Performance Profiler HUD](preview2.png) |
+| ![Preview 1 - Live Video Wallpaper Playback](preview1.png) | ![Preview 2 - Performance Profiler HUD](preview4.png) |
 | *Smooth 60 FPS video rendering directly on your desktop* | *Live wall-clock FPS, VRAM usage, and microsecond pipeline breakdown (`Ctrl+Alt+D`)* |
 
 | 📂 **Interactive File Picker (`Ctrl+Alt+G`)** | ⚡ **Smart Battery & Occlusion Saving** |
 | :---: | :---: |
-| ![Preview 3 - Interactive File Picker](preview3.png) | ![Preview 4 - Battery and Occlusion Saving](preview4.png) |
+| ![Preview 3 - Interactive File Picker](preview3.png) | ![Preview 4 - Battery and Occlusion Saving](preview2.png) |
 | *Instantly pick any local `.mp4` video on the fly* | *Auto-pauses when gaming or running on laptop battery* |
 
 ---

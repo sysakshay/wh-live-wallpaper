@@ -89,10 +89,11 @@ Mute video audio track (`true` / `false`).
   $description: Full path to an .mp4 file on disk. Tip -- press Ctrl+Alt+G in the desktop to pick a file interactively instead of typing a path here.
 - fitMode: fill
   $name: Fit mode
-  $description: How to scale the video to fill the screen
+  $description: How to scale the video across your monitor
   $options:
-  - fill: Fill (stretch, may distort)
-  - fit: Fit (letterbox, preserve aspect)
+  - fill: Fill / Stretch (stretch both horizontally & vertically to fill screen)
+  - cover: Cover / Zoom (zoom and crop edges to fill screen without distortion)
+  - fit: Fit (letterbox with aspect ratio preserved and black borders)
 - batteryMode: pause
   $name: Battery saving mode
   $description: What to do when running on laptop battery power
@@ -164,7 +165,7 @@ enum class BatteryMode { Pause, DropFps, Normal };
 // -- correct without adding any lock contention to the render path.
 CRITICAL_SECTION g_pathLock;
 std::wstring g_videoPath;
-std::atomic<bool> g_fitStretch{true}; // true = fill/stretch, false = fit
+std::atomic<int> g_fitMode{0}; // 0 = fill/stretch, 1 = cover/zoom, 2 = fit/letterbox
 std::atomic<BatteryMode> g_batteryMode{BatteryMode::Pause};
 std::atomic<int> g_targetFps{60};
 std::atomic<bool> g_audioMuted{true};
@@ -201,9 +202,19 @@ std::wstring LoadSettings() {
     }
   }
 
-  PCWSTR fitMode = Wh_GetStringSetting(L"fitMode");
-  g_fitStretch = (wcscmp(fitMode, L"fill") == 0);
-  Wh_FreeStringSetting(fitMode);
+  PCWSTR fitModeStr = Wh_GetStringSetting(L"fitMode");
+  if (fitModeStr) {
+    if (wcscmp(fitModeStr, L"cover") == 0) {
+      g_fitMode = 1;
+    } else if (wcscmp(fitModeStr, L"fit") == 0) {
+      g_fitMode = 2;
+    } else {
+      g_fitMode = 0;
+    }
+    Wh_FreeStringSetting(fitModeStr);
+  } else {
+    g_fitMode = 0;
+  }
 
   PCWSTR batteryModeStr = Wh_GetStringSetting(L"batteryMode");
   BatteryMode newBatteryMode;
@@ -248,6 +259,7 @@ HWND g_wallpaperWnd = nullptr;
 const UINT_PTR kRenderTimerId = 1;
 const UINT_PTR kZOrderTimerId = 2;
 const UINT_PTR kOcclusionTimerId = 3;
+const UINT_PTR kSourceRetryTimerId = 4;
 const int kHotkeyId = 1;
 const int kVisibilityHotkeyId = 2;
 const int kProfilerHotkeyId = 3;
@@ -261,6 +273,7 @@ const UINT kMsgUpdateSettings = WM_APP + 3;
 constexpr UINT WM_SPAWN_WORKER = 0x052C;
 
 bool g_topLevelMode = false;
+int g_sourceRetryAttempts = 0;
 bool g_wallpaperHidden = false;
 bool g_isOnBattery = false;
 
@@ -347,6 +360,7 @@ struct VideoPlayer {
   bool pausedForBattery = false;
   bool pausedForSession = false;
   DWORD loadStartTickMs = 0;
+  DWORD canPlayTickMs = 0;
   bool loadTimeoutLogged = false;
   int loadTimeoutRetryCount = 0;
   static const int kMaxLoadTimeoutRetries = 3;
@@ -591,6 +605,7 @@ struct VideoPlayer {
     wantsPlay = true;
     destRectValid = false;
     loadStartTickMs = GetTickCount();
+    canPlayTickMs = 0;
     loadTimeoutLogged = false;
     loadTimeoutRetryCount = 0;
     Wh_Log(L"VideoPlayer::Load: source set to %s", path.c_str());
@@ -633,7 +648,7 @@ struct VideoPlayer {
            L"(attempt %d/%d) -- reloading",
            loadTimeoutRetryCount, kMaxLoadTimeoutRetries);
     if (boundHwnd) {
-      PostMessageW(boundHwnd, kMsgReloadSource, 0, 0);
+      OnDeviceLost();
     }
   }
 
@@ -686,6 +701,9 @@ struct VideoPlayer {
 
   void OnCanPlay() {
     canPlay = true;
+    if (canPlayTickMs == 0) {
+      canPlayTickMs = GetTickCount();
+    }
     DWORD videoW = 0, videoH = 0;
     if (SUCCEEDED(engine->GetNativeVideoSize(&videoW, &videoH))) {
       Profiler::RecordVideoMetadata((int)videoW, (int)videoH, L"MP4/MF", 60.0f);
@@ -775,12 +793,12 @@ struct VideoPlayer {
     Profiler::RecordEvent(L"Resize");
   }
 
-  void ComputeDestRect(RECT &dest, bool fitStretch) {
+  void ComputeDestRect(RECT &dest, int fitMode) {
     Profiler::BeginSection("ComputeDestRect");
     struct DestGuard {
       ~DestGuard() { Profiler::EndSection("ComputeDestRect"); }
     } destGuard;
-    if (fitStretch || !engine.Get()) {
+    if (fitMode != 2 || !engine.Get()) {
       dest = {0, 0, width, height};
       return;
     }
@@ -894,7 +912,7 @@ struct VideoPlayer {
   DWORD lastDropFpsTick = 0;
   DWORD lastSuccessTickMs = 0;
 
-  bool Tick(bool fitStretch, bool isOnBattery) {
+  bool Tick(int fitMode, bool isOnBattery) {
     tickCallCount++;
     Profiler::RecordTickCall();
     Profiler::UpdateWindowsState(pausedForFullscreen, pausedForBattery, pausedForSession, g_wallpaperHidden, isOnBattery);
@@ -942,13 +960,17 @@ struct VideoPlayer {
                engine->GetCurrentTime());
       }
 #endif
-      // If stalled for more than 4 seconds while active and unpaused, recover
-      // from sleep/lock stall:
-      if (lastSuccessTickMs != 0 && (now - lastSuccessTickMs > 4000)) {
-        Wh_Log(L"VideoPlayer::Tick: stalled after sleep/lock (>4s without "
-               L"ready frame), triggering reload");
-        lastSuccessTickMs = now;
-        PostMessageW(boundHwnd, kMsgReloadSource, 0, 0);
+      // If stalled while active and unpaused (either >4s after last frame or >5s right
+      // after boot/CANPLAY before the first frame ever presents), recover:
+      if (canPlay && wantsPlay && !IsEffectivePaused()) {
+        if ((lastSuccessTickMs != 0 && (now - lastSuccessTickMs > 4000)) ||
+            (lastSuccessTickMs == 0 && canPlayTickMs != 0 && (now - canPlayTickMs > 5000))) {
+          Wh_Log(L"VideoPlayer::Tick: stalled after sleep/lock/boot (>4s without "
+                 L"ready frame), triggering recovery");
+          lastSuccessTickMs = now;
+          canPlayTickMs = now;
+          OnDeviceLost();
+        }
       }
       return false;
     }
@@ -962,7 +984,7 @@ struct VideoPlayer {
     } frameGuard;
 
     RECT dest;
-    ComputeDestRect(dest, fitStretch);
+    ComputeDestRect(dest, fitMode);
 
     ComPtr<ID3D11Texture2D> backBuffer;
     hr = swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D),
@@ -974,6 +996,41 @@ struct VideoPlayer {
       return false;
     }
 
+    // Always clear target textures to solid black before transferring so any
+    // letterbox borders or offscreen areas never show underlying Windows wallpaper
+    auto clearTexture = [this](ID3D11Texture2D* tex) {
+      if (!tex || !d3dDevice || !d3dContext) return;
+      ComPtr<ID3D11RenderTargetView> rtv;
+      if (SUCCEEDED(d3dDevice->CreateRenderTargetView(tex, nullptr, &rtv))) {
+        static const float kBlack[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        d3dContext->ClearRenderTargetView(rtv.Get(), kBlack);
+      }
+    };
+    clearTexture(backBuffer.Get());
+    if (renderTarget.Get()) {
+      clearTexture(renderTarget.Get());
+    }
+
+    MFVideoNormalizedRect srcRect = {0.0f, 0.0f, 1.0f, 1.0f};
+    bool useSrcRect = false;
+    if (fitMode == 1 && cachedVideoW > 0 && cachedVideoH > 0 && width > 0 && height > 0) {
+      float screenAspect = (float)width / (float)height;
+      float videoAspect = (float)cachedVideoW / (float)cachedVideoH;
+      if (videoAspect > screenAspect && screenAspect > 0) {
+        float cropW = screenAspect / videoAspect;
+        srcRect.left = (1.0f - cropW) / 2.0f;
+        srcRect.right = srcRect.left + cropW;
+        useSrcRect = true;
+      } else if (videoAspect < screenAspect && videoAspect > 0) {
+        float cropH = videoAspect / screenAspect;
+        srcRect.top = (1.0f - cropH) / 2.0f;
+        srcRect.bottom = srcRect.top + cropH;
+        useSrcRect = true;
+      }
+    }
+    const MFVideoNormalizedRect* pSrc = useSrcRect ? &srcRect : nullptr;
+    const RECT* pDst = (fitMode == 2) ? &dest : nullptr;
+
     static const MFARGB kBorderColor = {0, 0, 0, 0xFF};
     LARGE_INTEGER tStart, tEnd;
     LARGE_INTEGER qpcFreq;
@@ -983,7 +1040,7 @@ struct VideoPlayer {
     Profiler::BeginSection("TransferVideoFrame");
     bool usedDirectBackBuffer = false;
     if (transferMode == TransferMode::DirectBackBuffer || transferMode == TransferMode::Unknown) {
-      hr = engine->TransferVideoFrame(backBuffer.Get(), nullptr, &dest, &kBorderColor);
+      hr = engine->TransferVideoFrame(backBuffer.Get(), pSrc, pDst, &kBorderColor);
       if (SUCCEEDED(hr)) {
         if (transferMode == TransferMode::Unknown) {
           Wh_Log(L"VideoPlayer::Tick: direct TransferVideoFrame to backBuffer succeeded; locking in DirectBackBuffer mode");
@@ -998,9 +1055,10 @@ struct VideoPlayer {
     if (transferMode == TransferMode::OffscreenFallback) {
       if (!renderTarget.Get()) {
         CreateRenderTarget(width, height);
+        clearTexture(renderTarget.Get());
       }
       if (renderTarget.Get()) {
-        hr = engine->TransferVideoFrame(renderTarget.Get(), nullptr, &dest, &kBorderColor);
+        hr = engine->TransferVideoFrame(renderTarget.Get(), pSrc, pDst, &kBorderColor);
         usedDirectBackBuffer = false;
       } else {
         hr = E_FAIL;
@@ -1125,31 +1183,37 @@ BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
   return TRUE;
 }
 
-HWND FindClassicTopLevelWorkerW(HWND progman) {
+HWND FindClassicTopLevelWorkerW(HWND progman, bool verbose = true) {
   HWND workerW = nullptr;
   EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&workerW));
   if (workerW) {
-    Wh_Log(L"FindClassicTopLevelWorkerW: found top-level WorkerW sibling 0x%p",
-           workerW);
+    if (verbose) {
+      Wh_Log(L"FindClassicTopLevelWorkerW: found top-level WorkerW sibling 0x%p",
+             workerW);
+    }
     return workerW;
   }
   return nullptr;
 }
 
-HWND FindChildWorkerW(HWND progman) {
+HWND FindChildWorkerW(HWND progman, bool verbose = true) {
   HWND workerW = nullptr;
   while ((workerW = FindWindowExW(progman, workerW, L"WorkerW", nullptr)) !=
          nullptr) {
     HWND defView =
         FindWindowExW(workerW, nullptr, L"SHELLDLL_DefView", nullptr);
     if (!defView) {
-      Wh_Log(
-          L"FindChildWorkerW: found child WorkerW 0x%p (no SHELLDLL_DefView)",
-          workerW);
+      if (verbose) {
+        Wh_Log(
+            L"FindChildWorkerW: found child WorkerW 0x%p (no SHELLDLL_DefView)",
+            workerW);
+      }
       return workerW;
     }
   }
-  Wh_Log(L"FindChildWorkerW: no usable child WorkerW found under Progman");
+  if (verbose) {
+    Wh_Log(L"FindChildWorkerW: no usable child WorkerW found under Progman");
+  }
   return nullptr;
 }
 
@@ -1182,10 +1246,66 @@ void GetVirtualScreenRect(RECT &rc) {
 }
 
 void PinBehindTargetWindow() {
-  if (!g_topLevelMode || !g_wallpaperWnd || g_wallpaperHidden)
+  if (!g_wallpaperWnd || g_wallpaperHidden)
     return;
+
+  // Check if Progman exists and verify whether the active WorkerW hierarchy changed
+  // (e.g., right after turning on the laptop / booting when Explorer creates WorkerW).
+  HWND progman = FindWindowW(L"Progman", nullptr);
+  if (progman) {
+    HWND activeWorkerW = FindClassicTopLevelWorkerW(progman, false);
+    if (!activeWorkerW) {
+      activeWorkerW = FindChildWorkerW(progman, false);
+    }
+
+    if (activeWorkerW) {
+      // If we were previously top-level or attached to a stale/destroyed WorkerW parent,
+      // reparent dynamically to the active WorkerW hosting desktop icons.
+      HWND currentParent = GetParent(g_wallpaperWnd);
+      if (g_topLevelMode || currentParent != activeWorkerW) {
+        Wh_Log(L"PinBehindTargetWindow: attaching wallpaper window to active WorkerW 0x%p (old parent 0x%p, topLevel=%d)",
+               activeWorkerW, currentParent, g_topLevelMode ? 1 : 0);
+        g_topLevelMode = false;
+        SetParent(g_wallpaperWnd, activeWorkerW);
+        DWORD style = GetWindowLongW(g_wallpaperWnd, GWL_STYLE);
+        style = (style & ~WS_POPUP) | WS_CHILD | WS_CLIPSIBLINGS;
+        SetWindowLongW(g_wallpaperWnd, GWL_STYLE, style);
+      }
+
+      // Ensure dimensions match activeWorkerW client area.
+      RECT rcHost = {};
+      if (GetClientRect(activeWorkerW, &rcHost)) {
+        int w = rcHost.right - rcHost.left;
+        int h = rcHost.bottom - rcHost.top;
+        if (w <= 0 || h <= 0) {
+          w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+          h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        }
+        if (w > 0 && h > 0 && (w != g_player.width || h != g_player.height)) {
+          Wh_Log(L"PinBehindTargetWindow: host dimensions changed to %dx%d, resizing", w, h);
+          SetWindowPos(g_wallpaperWnd, nullptr, 0, 0, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+          g_player.Resize(w, h);
+        }
+      }
+    } else if (!g_topLevelMode && !GetParent(g_wallpaperWnd)) {
+      // WorkerW disappeared or detached; switch to top-level fallback mode.
+      Wh_Log(L"PinBehindTargetWindow: WorkerW detached, switching to top-level fallback mode");
+      g_topLevelMode = true;
+      DWORD style = GetWindowLongW(g_wallpaperWnd, GWL_STYLE);
+      style = (style & ~WS_CHILD) | WS_POPUP | WS_CLIPSIBLINGS;
+      SetWindowLongW(g_wallpaperWnd, GWL_STYLE, style);
+    }
+  }
+
+  // Always keep at the bottom of the Z-order (both inside WorkerW and in top-level mode)
   SetWindowPos(g_wallpaperWnd, HWND_BOTTOM, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+  // If rendering is active and canPlay is true, make sure our window hasn't been hidden
+  // by Explorer during startup/theme transition.
+  if (g_player.canPlay && !IsWindowVisible(g_wallpaperWnd)) {
+    ShowWindow(g_wallpaperWnd, SW_SHOWNOACTIVATE);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1455,6 +1575,7 @@ void CheckBatteryState() {
 // ---------------------------------------------------------------------------
 
 bool PickAndLoadVideoViaDialog(HWND ownerWnd);
+void ReloadWallpaperSource();
 
 LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
                                   LPARAM lParam) {
@@ -1469,7 +1590,7 @@ LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   }
   case WM_TIMER: {
     if (wParam == kRenderTimerId) {
-      g_player.Tick(g_fitStretch.load(), g_isOnBattery);
+      g_player.Tick(g_fitMode.load(), g_isOnBattery);
     } else if (wParam == kOcclusionTimerId) {
       g_player.CheckLoadTimeout();
       CheckBatteryState();
@@ -1477,6 +1598,9 @@ LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       g_player.SetPausedForFullscreen(covered);
     } else if (wParam == kZOrderTimerId) {
       PinBehindTargetWindow();
+    } else if (wParam == kSourceRetryTimerId) {
+      KillTimer(hwnd, kSourceRetryTimerId);
+      ReloadWallpaperSource();
     }
     return 0;
   }
@@ -1580,6 +1704,7 @@ LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     KillTimer(hwnd, kRenderTimerId);
     KillTimer(hwnd, kZOrderTimerId);
     KillTimer(hwnd, kOcclusionTimerId);
+    KillTimer(hwnd, kSourceRetryTimerId);
     return 0;
   }
   return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -1651,11 +1776,22 @@ void ReloadWallpaperSource() {
   Profiler::RecordEvent(L"Reload");
   std::wstring path;
   if (!ResolveVideoSource(path)) {
-    Wh_Log(L"ReloadWallpaperSource: could not resolve a video source");
+    g_sourceRetryAttempts++;
+    Wh_Log(L"ReloadWallpaperSource: could not resolve a video source (attempt %d/30)",
+           g_sourceRetryAttempts);
     if (g_wallpaperWnd && IsWindowVisible(g_wallpaperWnd)) {
       ShowWindow(g_wallpaperWnd, SW_HIDE);
     }
+    if (g_wallpaperWnd && g_sourceRetryAttempts < 30) {
+      SetTimer(g_wallpaperWnd, kSourceRetryTimerId, 2000, nullptr);
+    } else if (g_wallpaperWnd) {
+      KillTimer(g_wallpaperWnd, kSourceRetryTimerId);
+    }
     return;
+  }
+  g_sourceRetryAttempts = 0;
+  if (g_wallpaperWnd) {
+    KillTimer(g_wallpaperWnd, kSourceRetryTimerId);
   }
   if (!g_player.Load(path)) {
     if (g_wallpaperWnd && IsWindowVisible(g_wallpaperWnd)) {
@@ -1694,21 +1830,18 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
   }
 
   HWND progman = nullptr;
-  for (int attempt = 0; attempt < 20 && !progman; attempt++) {
+  const int kProgmanMaxAttempts = 120; // ~60s worst case for slow boots
+  for (int attempt = 0; attempt < kProgmanMaxAttempts && !progman; attempt++) {
     progman = FindWindowW(L"Progman", nullptr);
     if (!progman)
-      Sleep(250);
+      Sleep(500);
   }
   if (!progman) {
-    Wh_Log(L"WallpaperThreadProc: Progman not found after retrying for 5s");
-    SetEvent(g_threadReadyEvent);
-    MFShutdown();
-    if (g_comInitialized)
-      CoUninitialize();
-    return 1;
+    Wh_Log(L"WallpaperThreadProc: Progman not found after extended retry, "
+           L"falling back to top-level mode without WorkerW");
   }
 
-  HWND classicWorkerW = TryFindClassicWorkerWWithRetries(progman);
+  HWND classicWorkerW = progman ? TryFindClassicWorkerWWithRetries(progman) : nullptr;
   g_topLevelMode = (classicWorkerW == nullptr);
 
   WNDCLASSW wc = {};
@@ -1780,13 +1913,13 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
   if (g_topLevelMode) {
     SetWindowPos(g_wallpaperWnd, HWND_BOTTOM, x, y, width, height,
                  SWP_NOACTIVATE | SWP_HIDEWINDOW);
-    SetTimer(g_wallpaperWnd, kZOrderTimerId, 1000, nullptr);
   } else {
     SetWindowPos(g_wallpaperWnd, nullptr, 0, 0, width, height,
                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_HIDEWINDOW);
     SetWindowPos(g_wallpaperWnd, HWND_BOTTOM, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
   }
+  SetTimer(g_wallpaperWnd, kZOrderTimerId, 1000, nullptr);
 
   if (!g_player.InitD3DAndSwapChain(g_wallpaperWnd, width, height) ||
       !g_player.InitMediaEngine(g_wallpaperWnd)) {
@@ -1881,6 +2014,7 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
     if (msg.message == kMsgReloadSource) {
+      g_sourceRetryAttempts = 0;
       ReloadWallpaperSource();
       continue;
     }

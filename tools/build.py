@@ -4,7 +4,7 @@
 tools/build.py - Professional C++ Modular Build System for Windhawk Mods
 ==============================================================================
 Assembles multiple C++ source files (.h, .hpp, .cpp) from `src/` into a single,
-clean translation unit (`generated/mod.wh.cpp`) for Windhawk compilation.
+clean translation unit (`generated/LiveVideoWallpaper.cpp`) for Windhawk compilation.
 
 Features:
 - Source discovery & duplicate filename check across subdirectories
@@ -43,7 +43,7 @@ class BuildError(Exception):
     pass
 
 class ModBuilder:
-    def __init__(self, src_dir="src", output_file="generated/mod.wh.cpp"):
+    def __init__(self, src_dir="src", output_file="generated/LiveVideoWallpaper.cpp"):
         self.project_root = Path(__file__).resolve().parent.parent
         self.src_dir = self.project_root / src_dir
         self.output_file = self.project_root / output_file
@@ -406,7 +406,7 @@ def main():
     parser.add_argument("--clean", action="store_true", help="Delete generated files.")
     parser.add_argument("--stats", action="store_true", help="Print detailed build statistics after building.")
     parser.add_argument("--src", default="src", help="Source directory containing .h and .cpp files (default: src).")
-    parser.add_argument("--output", default="generated/mod.wh.cpp", help="Output generated single source file path.")
+    parser.add_argument("--output", default="generated/LiveVideoWallpaper.cpp", help="Output generated single source file path.")
 
     args = parser.parse_args()
     builder = ModBuilder(src_dir=args.src, output_file=args.output)

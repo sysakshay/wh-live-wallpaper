@@ -27,7 +27,6 @@
 #include <dxgi1_2.h>
 #include <dxgi1_4.h>
 #include <string>
-#include <vector>
 #include <windows.h>
 
 // ---------------------------------------------------------------------------
@@ -192,19 +191,22 @@ public:
   }
 
   // Computes statistical percentile (0.0 to 1.0, e.g. 0.95 for 95th percentile).
-  // Uses std::nth_element on a vector copy when count > 0 to avoid locking or
-  // mutating the live buffer, using O(N) average time without fixed capacity stack allocation.
+  // Computes statistical percentile (0.0 to 1.0, e.g. 0.95 for 95th percentile).
+  // Uses a stack-allocated buffer when count > 0 to avoid heap allocations.
   float GetPercentile(float p) const {
     if (count == 0)
       return 0.0f;
     if (count == 1)
       return values[0];
 
-    std::vector<float> temp(values, values + count);
+    float temp[Capacity];
+    for (size_t i = 0; i < count; ++i) {
+      temp[i] = values[i];
+    }
     size_t idx = static_cast<size_t>(p * (count - 1));
     if (idx >= count)
       idx = count - 1;
-    std::nth_element(temp.begin(), temp.begin() + idx, temp.end());
+    std::nth_element(temp, temp + idx, temp + count);
     return temp[idx];
   }
 
@@ -222,8 +224,11 @@ public:
       return;
     }
 
-    std::vector<float> temp(values, values + count);
-    std::sort(temp.begin(), temp.end());
+    float temp[Capacity];
+    for (size_t i = 0; i < count; ++i) {
+      temp[i] = values[i];
+    }
+    std::sort(temp, temp + count);
     size_t idx1 = static_cast<size_t>(p1 * (count - 1));
     if (idx1 >= count)
       idx1 = count - 1;

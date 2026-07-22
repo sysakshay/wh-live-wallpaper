@@ -87,7 +87,8 @@ In the Windhawk **Settings** tab for this mod, you can customize the following o
   * `drop`: Reduce target frame rate to 15 FPS while on battery.
   * `normal`: Maintain full speed playback regardless of battery status.
 * **Target frame rate (`targetFps`):** Choose between `monitor` (sync exactly with display V-Sync refresh rate), `60`, `30`, or `15` FPS.
-* **Mute audio output (`audioMuted`):** Whether to mute audio tracks embedded in your `.mp4` files (`true` by default).
+* **Mute audio output (`audioMuted`):** Whether to mute audio tracks embedded in your video files (`true` by default).
+* **Audio volume (`audioVolume`):** Audio output volume percentage from `0` to `100` (`100` by default).
 
 ---
 
@@ -98,6 +99,19 @@ In the Windhawk **Settings** tab for this mod, you can customize the following o
 * **Single-Pass Percentile Sorting:** `P95` and `P99` frame-time percentiles are computed simultaneously in a single ring-buffer sort pass at 60 Hz.
 * **Kernel Resource Caching:** GDI font handles (`HFONT`) and desktop region guards (`HRGN`) are cached across frames to eliminate handle churn.
 * **Fast Occlusion Screening:** Bounding-box intersection screening skips invisible, borderless system helpers and non-overlapping windows before querying DWM or window class attributes.
+
+---
+
+## 🆕 What's New in Version 1.1.0
+
+- 🔊 **Audio Volume Control & Stream Restoration:** Integrated dedicated volume control (`audioVolume` from `0%` to `100%`) with automatic unmuting and volume restoration when switching applications or resuming playback.
+- 🖥️ **Fixed Aspect Ratio & Vertical Stretching:** Fixed vertical stretching issue on wide, ultrawide (21:9 / 32:9), and 1:1 square monitors across `Fill`, `Cover`, and `Fit` modes.
+- ⚡ **Instant Event-Driven Occlusion Detection:** Uses Windows event hooks (`EVENT_SYSTEM_FOREGROUND`) for zero-latency (< 16ms) audio/video pause when maximizing or focusing application windows.
+- ⏱️ **Configurable Occlusion Polling (`occlusionInterval`):** Added user setting (`fast`: 100ms, `normal`: 250ms, `relaxed`: 500ms) for background occlusion safety-net checks.
+- 📂 **Async File Picker & Multi-Format Support:** Hotkey file picker (<kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>G</kbd>) now runs asynchronously on a background thread without pausing 60 FPS video rendering. Supports `.mp4`, `.m4v`, `.mov`, `.wmv`, and `.webm`. Path automatically populates in Windhawk UI settings.
+- 🎯 **Zero Desktop Right-Click Menu Delay:** Implemented `HTTRANSPARENT`, `WS_EX_TRANSPARENT`, and `WS_DISABLED` input transparency so right-clicking desktop icons or background opens context menus with zero latency.
+- ⚡ **DXGI Flip-Model Buffer Rotation RTV Caching:** Caches D3D11 render target views while handling DXGI swap-chain buffer rotation in `Fit` mode, eliminating up to 120 view creation calls per second.
+- 🛡️ **Cached WorkerW Hierarchy:** $O(1)$ cached `WorkerW` window handle validation avoids running `EnumWindows` across system windows every second.
 
 ---
 

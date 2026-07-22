@@ -4,6 +4,18 @@ All notable changes to the **Live Video Wallpaper** Windhawk mod will be documen
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1] - 2026-07-22
+
+### ❄️ Cold-Boot & Startup Reliability Fixes
+- **Non-Fatal Shell Discovery:** Extended `Progman` search retry budget to ~60s (120 attempts) and made it non-fatal. If `Progman` is missing on early boot, the mod gracefully falls back to top-level mode pinned to `HWND_BOTTOM` rather than exiting the thread.
+- **Dynamic `WorkerW` Reparenting:** `PinBehindTargetWindow` continuously queries for the active top-level `WorkerW` hosting `SHELLDLL_DefView` (desktop icons), dynamically attaching and scaling behind desktop icons as soon as Explorer finishes initializing on cold boot.
+- **Automatic Video Source & D3D Recovery Retries:** When video file resolution (e.g., secondary/USB drive mounting late) or D3D11/MediaEngine initialization fails on cold start, `ReloadWallpaperSource` schedules automatic retries every 2 seconds for up to 30 attempts (~60s), followed by background low-frequency polling every 10 seconds.
+- **Automatic D3D/MediaEngine Re-Initialization:** `g_player.Load` automatically calls `Recover()` to re-initialize missing D3D11 device and MediaEngine objects on subsequent retries.
+
+### 🛡️ Windhawk Mod PR Validation Compliance
+- **Line 1 Metadata Block Compliance:** Updated `tools/build.py` assembly logic to ensure `// ==WindhawkMod==` begins strictly at Line 1 for official Windhawk repository validation scripts.
+- **Canonical Metadata URLs:** Formatted `@github` (`https://github.com/sysakshay`) and `@twitter` (`https://twitter.com/iamtouchingyou`) directives with full HTTPS prefixes.
+
 ---
 
 ## [1.1.0] - 2026-07-22

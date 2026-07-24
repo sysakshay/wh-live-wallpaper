@@ -43,7 +43,7 @@ class BuildError(Exception):
     pass
 
 class ModBuilder:
-    def __init__(self, src_dir="src", output_file="generated/LiveVideoWallpaper.wh.cpp"):
+    def __init__(self, src_dir="src", output_file="generated/live-video-wallpaper.wh.cpp"):
         self.project_root = Path(__file__).resolve().parent.parent
         self.src_dir = self.project_root / src_dir
         self.output_file = self.project_root / output_file
@@ -312,12 +312,12 @@ class ModBuilder:
         final_code = "\n".join(output_chunks)
         self.output_file.write_text(final_code, encoding="utf-8")
         
-        # Also sync to root LiveVideoWallpaper.wh.cpp for Windhawk PR / submission
-        root_mod = self.project_root / "LiveVideoWallpaper.wh.cpp"
+        # Also sync to root live-video-wallpaper.wh.cpp for Windhawk PR / submission
+        root_mod = self.project_root / "live-video-wallpaper.wh.cpp"
         root_mod.write_text(final_code, encoding="utf-8")
         
         self.stats["output_size"] = len(final_code.encode("utf-8"))
-        print(f"Generating {self.output_file.name} and LiveVideoWallpaper.wh.cpp")
+        print(f"Generating {self.output_file.name} and live-video-wallpaper.wh.cpp")
         print("Done.")
 
     def run_build(self):
@@ -410,7 +410,7 @@ def main():
     parser.add_argument("--clean", action="store_true", help="Delete generated files.")
     parser.add_argument("--stats", action="store_true", help="Print detailed build statistics after building.")
     parser.add_argument("--src", default="src", help="Source directory containing .h and .cpp files (default: src).")
-    parser.add_argument("--output", default="generated/LiveVideoWallpaper.wh.cpp", help="Output generated single source file path.")
+    parser.add_argument("--output", default="generated/live-video-wallpaper.wh.cpp", help="Output generated single source file path.")
 
     args = parser.parse_args()
     builder = ModBuilder(src_dir=args.src, output_file=args.output)

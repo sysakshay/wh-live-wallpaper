@@ -1929,6 +1929,12 @@ DWORD g_pickerThreadId = 0;
 DWORD WINAPI FilePickerThreadProc(LPVOID param) {
   if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
     return 0;
+  HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  if (FAILED(comHr)) {
+    Wh_Log(L"FilePickerThreadProc: COM initialization failed, hr=0x%08lX",
+           static_cast<unsigned long>(comHr));
+    return 1;
+  }
   HWND ownerWnd = static_cast<HWND>(param);
   HWND tempOwner =
       CreateWindowExW(WS_EX_TOPMOST, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0,
@@ -1972,6 +1978,7 @@ DWORD WINAPI FilePickerThreadProc(LPVOID param) {
       PostMessageW(ownerWnd, kMsgReloadSource, 0, 0);
     }
   }
+  CoUninitialize();
   return 0;
 }
 
@@ -2086,8 +2093,7 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
   }
 
   HWND progman = nullptr;
-  const int kProgmanMaxAttempts = 120;
-  for (int attempt = 0; attempt < kProgmanMaxAttempts; attempt++) {
+  for (;;) {
     if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
       break;
     HWND shellWindow = GetShellWindow();
@@ -2096,6 +2102,7 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
       GetWindowThreadProcessId(shellWindow, &shellPid);
       if (shellPid != GetCurrentProcessId()) {
         Wh_Log(L"WallpaperThreadProc: this Explorer process does not own the desktop");
+        progman = nullptr;
         break;
       }
     }

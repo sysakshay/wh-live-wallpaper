@@ -12,11 +12,6 @@
 #include <psapi.h>
 #include <stdio.h>
 
-// External Windhawk logging declaration (supplied by Windhawk toolchain)
-#ifndef Wh_Log
-extern void Wh_Log(const wchar_t *format, ...);
-#endif
-
 // ----------------------------------------------------------------------------
 // Static Profiler State
 // ----------------------------------------------------------------------------
@@ -96,7 +91,7 @@ struct OverlayCache {
     }
   }
 };
-[[clang::no_destroy]] OverlayCache s_overlayCache;
+OverlayCache s_overlayCache;
 
 // Helper to retrieve or register a section by name without allocations
 SectionTimer *GetOrRegisterSection(const char *name) {

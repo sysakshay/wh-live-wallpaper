@@ -90,42 +90,6 @@ template <typename T> struct ComPtr {
   operator T *() const { return ptr; }
 };
 
-#ifndef __IDXGIAdapter3_INTERFACE_DEFINED__
-#define __IDXGIAdapter3_INTERFACE_DEFINED__
-enum DXGI_MEMORY_SEGMENT_GROUP {
-  DXGI_MEMORY_SEGMENT_GROUP_LOCAL = 0,
-  DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL = 1
-};
-
-struct DXGI_QUERY_VIDEO_MEMORY_INFO {
-  UINT64 Budget;
-  UINT64 CurrentUsage;
-  UINT64 AvailableForReservation;
-  UINT64 CurrentReservation;
-};
-
-MIDL_INTERFACE("645967A4-1392-4310-A798-8053CE3E93FD")
-IDXGIAdapter3 : public IDXGIAdapter2 {
-public:
-  virtual HRESULT STDMETHODCALLTYPE RegisterHardwareContentProtectionTeardownStatusEvent(
-      HANDLE hEvent, DWORD *pdwCookie) = 0;
-  virtual void STDMETHODCALLTYPE UnregisterHardwareContentProtectionTeardownStatus(
-      DWORD dwCookie) = 0;
-  virtual HRESULT STDMETHODCALLTYPE QueryVideoMemoryInfo(
-      UINT NodeIndex,
-      DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
-      DXGI_QUERY_VIDEO_MEMORY_INFO *pVideoMemoryInfo) = 0;
-  virtual HRESULT STDMETHODCALLTYPE SetVideoMemoryReservation(
-      UINT NodeIndex,
-      DXGI_MEMORY_SEGMENT_GROUP MemorySegmentGroup,
-      UINT64 Reservation) = 0;
-  virtual HRESULT STDMETHODCALLTYPE RegisterVideoMemoryBudgetChangeNotificationEvent(
-      HANDLE hEvent, DWORD *pdwCookie) = 0;
-  virtual void STDMETHODCALLTYPE UnregisterVideoMemoryBudgetChangeNotification(
-      DWORD dwCookie) = 0;
-};
-#endif
-
 // ----------------------------------------------------------------------------
 // Profiler Operating Modes
 // ----------------------------------------------------------------------------

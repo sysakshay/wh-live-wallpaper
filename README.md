@@ -36,6 +36,10 @@ Unlike traditional animated wallpaper applications that consume heavy background
 
 ## 🚀 Quick Start & First-Time Setup
 
+The pasteable Windhawk mod is [live-video-wallpaper.wh.cpp](live-video-wallpaper.wh.cpp).
+It is assembled from the three files in `src/` by running `py tools/build.py`.
+Edit the source files, then regenerate the single-file mod before submitting changes.
+
 ### 1️⃣ Prerequisites
 1. Download and install **[Windhawk](https://windhawk.net/)** (if you haven't already).
 2. Ensure you are running **Windows 10** or **Windows 11**.
@@ -58,13 +62,13 @@ There are two easy ways to pick your video:
 | :--- | :--- | :--- |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>G</kbd> | **📂 Open File Picker** | Instantly open an interactive Windows file dialog to pick and load a new `.mp4` video without leaving the desktop. |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>H</kbd> | **👁️ Toggle Visibility** | Show or hide the video wallpaper on demand. |
-| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>D</kbd> | **📊 Toggle Profiler HUD** | Show or hide the real-time developer Performance & Diagnostics Overlay. |
+| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>D</kbd> | **📊 Toggle Profiler HUD** | Show or hide the diagnostics overlay after enabling its hotkey in settings. |
 
 ---
 
 ## 📊 Built-In Performance Profiler HUD (`Ctrl + Alt + D`)
 
-Curious about your system's resource usage or frame timing? Press <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>D</kbd> to bring up an on-screen hardware profiler modeled after professional game engine diagnostic tools:
+Enable the profiler hotkey in the mod settings, then press <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>D</kbd> to bring up the diagnostics overlay:
 
 * 🟢 / 🟡 / 🔴 **Color-Coded Health Indicators:** Instantly spot bottlenecks or warnings.
 * ⏱️ **Frame Timing Diagnostics:** Displays true wall-clock `FPS`, rolling average `Frame Time`, and `P95` / `P99` frame time percentiles.
@@ -89,6 +93,7 @@ In the Windhawk **Settings** tab for this mod, you can customize the following o
 * **Target frame rate (`targetFps`):** Choose between `monitor` (sync exactly with display V-Sync refresh rate), `60`, `30`, or `15` FPS.
 * **Mute audio output (`audioMuted`):** Whether to mute audio tracks embedded in your video files (`true` by default).
 * **Audio volume (`audioVolume`):** Audio output volume percentage from `0` to `100` (`100` by default).
+* **Hotkeys:** Enable or disable the file picker, visibility, and profiler hotkeys independently. The profiler hotkey is disabled by default.
 
 ---
 
@@ -108,7 +113,7 @@ In the Windhawk **Settings** tab for this mod, you can customize the following o
 - 🖥️ **Fixed Aspect Ratio & Vertical Stretching:** Fixed vertical stretching issue on wide, ultrawide (21:9 / 32:9), and 1:1 square monitors across `Fill`, `Cover`, and `Fit` modes.
 - ⚡ **Instant Event-Driven Occlusion Detection:** Uses Windows event hooks (`EVENT_SYSTEM_FOREGROUND`) for zero-latency (< 16ms) audio/video pause when maximizing or focusing application windows.
 - ⏱️ **Configurable Occlusion Polling (`occlusionInterval`):** Added user setting (`fast`: 100ms, `normal`: 250ms, `relaxed`: 500ms) for background occlusion safety-net checks.
-- 📂 **Async File Picker & Multi-Format Support:** Hotkey file picker (<kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>G</kbd>) now runs asynchronously on a background thread without pausing 60 FPS video rendering. Supports `.mp4`, `.m4v`, `.mov`, `.wmv`, and `.webm`. Path automatically populates in Windhawk UI settings.
+- 📂 **Async File Picker & Multi-Format Support:** Hotkey file picker (<kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>G</kbd>) runs asynchronously. Supports `.mp4`, `.m4v`, `.mov`, `.wmv`, and `.webm`. The chosen path is saved in Windhawk's mod storage.
 - 🎯 **Zero Desktop Right-Click Menu Delay:** Implemented `HTTRANSPARENT`, `WS_EX_TRANSPARENT`, and `WS_DISABLED` input transparency so right-clicking desktop icons or background opens context menus with zero latency.
 - ⚡ **DXGI Flip-Model Buffer Rotation RTV Caching:** Caches D3D11 render target views while handling DXGI swap-chain buffer rotation in `Fit` mode, eliminating up to 120 view creation calls per second.
 - 🛡️ **Cached WorkerW Hierarchy:** $O(1)$ cached `WorkerW` window handle validation avoids running `EnumWindows` across system windows every second.

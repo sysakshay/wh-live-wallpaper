@@ -40,7 +40,7 @@ playback.
 
 - **`Ctrl + Alt + G`** — Open the interactive file picker to load a new video (`.mp4`, `.m4v`, `.mov`, `.wmv`, `.webm`).
 - **`Ctrl + Alt + H`** — Toggle wallpaper visibility on/off.
-- **`Ctrl + Alt + D`** — Toggle Performance Profiler HUD (On / Off).
+- **`Ctrl + Alt + D`** — Toggle Performance Profiler HUD (On / Off), if enabled in settings.
 
 ## Performance Profiler HUD
 
@@ -139,6 +139,12 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
     - fast: Fast (100 ms)
     - normal: Normal (250 ms)
     - relaxed: Battery Saver / Relaxed (500 ms)
+- filePickerHotkey: true
+  $name: Enable Ctrl+Alt+G file picker hotkey
+- visibilityHotkey: true
+  $name: Enable Ctrl+Alt+H visibility hotkey
+- profilerHotkey: false
+  $name: Enable Ctrl+Alt+D profiler hotkey
 */
 // ==/WindhawkModSettings==
 // clang-format on
@@ -180,6 +186,7 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
 // ---------------------------------------------------------------------------
 
 HWND g_wallpaperWnd = nullptr;
+HANDLE g_shutdownEvent = nullptr;
 const UINT_PTR kRenderTimerId = 1;
 const UINT_PTR kZOrderTimerId = 2;
 const UINT_PTR kOcclusionTimerId = 3;
@@ -215,6 +222,9 @@ std::atomic<int> g_targetFps{60};
 std::atomic<bool> g_audioMuted{true};
 std::atomic<int> g_audioVolume{100};
 std::atomic<int> g_occlusionIntervalMs{250};
+std::atomic<bool> g_filePickerHotkey{true};
+std::atomic<bool> g_visibilityHotkey{true};
+std::atomic<bool> g_profilerHotkey{false};
 
 std::wstring GetVideoPathSetting() {
   EnterCriticalSection(&g_pathLock);
@@ -228,6 +238,14 @@ std::wstring GetVideoPathSetting() {
 // as opposed to just fitMode/batteryMode -- only a real source change
 // needs to interrupt playback with a reload.
 static std::wstring s_lastWindhawkSettingVideoPath;
+static bool s_lastSettingLoaded = false;
+
+std::wstring ReadStoredPath(PCWSTR name) {
+  std::wstring storedPath(32768, L'\0');
+  if (Wh_GetStringValue(name, storedPath.data(), storedPath.size()) == 0)
+    return L"";
+  return storedPath.c_str();
+}
 
 std::wstring LoadSettings() {
   PCWSTR videoPathSettingRaw = Wh_GetStringSetting(L"videoPath");
@@ -237,39 +255,22 @@ std::wstring LoadSettings() {
 
   EnterCriticalSection(&g_pathLock);
   std::wstring oldPath = g_videoPath;
+  if (!s_lastSettingLoaded) {
+    s_lastWindhawkSettingVideoPath = ReadStoredPath(L"LastSettingVideoPath");
+    s_lastSettingLoaded = true;
+  }
 
   // Check if the user explicitly changed the videoPath setting text inside the Windhawk UI
   if (settingPath != s_lastWindhawkSettingVideoPath) {
     s_lastWindhawkSettingVideoPath = settingPath;
-    if (!settingPath.empty()) {
-      g_videoPath = settingPath;
-      HKEY hKey = nullptr;
-      if (RegCreateKeyExW(HKEY_CURRENT_USER,
-                          L"Software\\Windhawk\\LiveVideoWallpaper", 0, nullptr, 0,
-                          KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
-        RegSetValueExW(
-            hKey, L"LastPickedVideoPath", 0, REG_SZ, (const BYTE *)settingPath.c_str(),
-            (DWORD)((settingPath.length() + 1) * sizeof(wchar_t)));
-        RegCloseKey(hKey);
-      }
-    }
+    Wh_SetStringValue(L"LastSettingVideoPath", settingPath.c_str());
+    g_videoPath = settingPath;
+    Wh_SetStringValue(L"LastPickedVideoPath", settingPath.c_str());
   }
 
-  // If g_videoPath is currently empty (e.g. initial boot with no setting provided), try registry
+  // Restore the last picker choice if the settings path is empty on startup.
   if (g_videoPath.empty()) {
-    HKEY hKey = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-                      L"Software\\Windhawk\\LiveVideoWallpaper", 0, KEY_READ,
-                      &hKey) == ERROR_SUCCESS) {
-      wchar_t regBuf[MAX_PATH * 2] = {};
-      DWORD bufBytes = sizeof(regBuf) - sizeof(wchar_t);
-      if (RegQueryValueExW(hKey, L"LastPickedVideoPath", nullptr, nullptr,
-                           (LPBYTE)regBuf, &bufBytes) == ERROR_SUCCESS) {
-        g_videoPath = regBuf;
-        s_lastWindhawkSettingVideoPath = regBuf;
-      }
-      RegCloseKey(hKey);
-    }
+    g_videoPath = ReadStoredPath(L"LastPickedVideoPath");
   }
 
   PCWSTR fitModeStr = Wh_GetStringSetting(L"fitMode");
@@ -337,6 +338,9 @@ std::wstring LoadSettings() {
     Wh_FreeStringSetting(occlusionIntervalStr);
   }
   g_occlusionIntervalMs = newOcclusionMs;
+  g_filePickerHotkey = Wh_GetIntSetting(L"filePickerHotkey") != 0;
+  g_visibilityHotkey = Wh_GetIntSetting(L"visibilityHotkey") != 0;
+  g_profilerHotkey = Wh_GetIntSetting(L"profilerHotkey") != 0;
 
   LeaveCriticalSection(&g_pathLock);
   return oldPath;
@@ -843,7 +847,8 @@ struct VideoPlayer {
       cachedVideoW = videoW;
       cachedVideoH = videoH;
       destRectValid = false;
-      Profiler::RecordVideoMetadata((int)videoW, (int)videoH, L"MP4/MF", 60.0f);
+      Profiler::RecordVideoMetadata((int)videoW, (int)videoH,
+                                    L"Media Foundation", 0.0f);
     }
     if (engine.Get()) {
       engine->SetMuted(g_audioMuted.load() ? TRUE : FALSE);
@@ -1237,15 +1242,16 @@ struct VideoPlayer {
     }
 
     if (cachedVideoW > 0 && cachedVideoH > 0) {
-      Profiler::RecordVideoMetadata((int)cachedVideoW, (int)cachedVideoH, L"H.264 (Hardware Decode)", 60.0f);
+      Profiler::RecordVideoMetadata((int)cachedVideoW, (int)cachedVideoH,
+                                    L"Media Foundation", 0.0f);
     }
-    int activeTextures = (renderTarget.Get() ? 1 : 0) + (backBuffer.Get() ? 1 : 0) + 4; // +4 for MF internal decoder DPB surfaces
+    int activeTextures = (renderTarget.Get() ? 1 : 0) + (backBuffer.Get() ? 1 : 0);
     int activeSwapChains = swapChain.Get() ? 1 : 0;
     int activeMediaEngines = engine.Get() ? 1 : 0;
-    int activeSurfaces = 4;
+    int activeSurfaces = 0; // Media Foundation internals are not observable here.
     int activeComObjects = (d3dDevice.Get() ? 1 : 0) + (d3dContext.Get() ? 1 : 0) + (swapChain.Get() ? 1 : 0) +
                            (dxgiManager.Get() ? 1 : 0) + (engine.Get() ? 1 : 0) + (renderTarget.Get() ? 1 : 0) +
-                           (backBuffer.Get() ? 1 : 0) + 30; // +30 internal COM objects
+                           (backBuffer.Get() ? 1 : 0);
     Profiler::UpdateResourceStats(activeTextures, activeSwapChains, activeMediaEngines, activeSurfaces, activeComObjects);
 
     ID3D11Texture2D *overlayTarget = usedDirectBackBuffer ? backBuffer.Get() : renderTarget.Get();
@@ -1317,7 +1323,7 @@ struct VideoPlayer {
   }
 };
 
-VideoPlayer g_player;
+[[clang::no_destroy]] VideoPlayer g_player;
 
 // ---------------------------------------------------------------------------
 // Window finding (unchanged from the working GIF build)
@@ -1374,13 +1380,16 @@ HWND TryFindClassicWorkerWWithRetries(HWND progman) {
                       &result);
 
   for (int attempt = 0; attempt < 10; attempt++) {
+    if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
+      return nullptr;
     HWND workerW = FindClassicTopLevelWorkerW(progman);
     if (workerW)
       return workerW;
     HWND childWorkerW = FindChildWorkerW(progman);
     if (childWorkerW)
       return childWorkerW;
-    Sleep(200);
+    if (WaitForSingleObject(g_shutdownEvent, 200) == WAIT_OBJECT_0)
+      return nullptr;
     SendMessageTimeoutW(progman, WM_SPAWN_WORKER, 0, 0, SMTO_NORMAL, 1000,
                         &result);
   }
@@ -1914,7 +1923,12 @@ bool ResolveVideoSource(std::wstring &outPath) {
   return true;
 }
 
+HANDLE g_pickerThread = nullptr;
+DWORD g_pickerThreadId = 0;
+
 DWORD WINAPI FilePickerThreadProc(LPVOID param) {
+  if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
+    return 0;
   HWND ownerWnd = static_cast<HWND>(param);
   HWND tempOwner =
       CreateWindowExW(WS_EX_TOPMOST, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0,
@@ -1925,7 +1939,7 @@ DWORD WINAPI FilePickerThreadProc(LPVOID param) {
     SetForegroundWindow(tempOwner);
   }
 
-  wchar_t fileBuffer[MAX_PATH] = {};
+  wchar_t fileBuffer[32768] = {};
   OPENFILENAMEW ofn = {};
   ofn.lStructSize = sizeof(ofn);
   ofn.hwndOwner = tempOwner ? tempOwner : ownerWnd;
@@ -1936,11 +1950,12 @@ DWORD WINAPI FilePickerThreadProc(LPVOID param) {
   ofn.lpstrTitle = L"Pick a video for your wallpaper";
   ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
-  BOOL picked = GetOpenFileNameW(&ofn);
+  BOOL picked = WaitForSingleObject(g_shutdownEvent, 0) != WAIT_OBJECT_0 &&
+                GetOpenFileNameW(&ofn);
   if (tempOwner)
     DestroyWindow(tempOwner);
 
-  if (picked) {
+  if (picked && WaitForSingleObject(g_shutdownEvent, 0) != WAIT_OBJECT_0) {
     Wh_Log(L"FilePickerThreadProc: picked %s", fileBuffer);
 
     // Persist the picked path so that device-loss recovery
@@ -1948,20 +1963,12 @@ DWORD WINAPI FilePickerThreadProc(LPVOID param) {
     // choice, not whatever was in the settings panel.
     EnterCriticalSection(&g_pathLock);
     g_videoPath = fileBuffer;
-    s_lastWindhawkSettingVideoPath = fileBuffer;
     LeaveCriticalSection(&g_pathLock);
 
-    HKEY hKey = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER,
-                        L"Software\\Windhawk\\LiveVideoWallpaper", 0, nullptr, 0,
-                        KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
-      RegSetValueExW(
-          hKey, L"LastPickedVideoPath", 0, REG_SZ, (const BYTE *)fileBuffer,
-          (DWORD)((wcslen(fileBuffer) + 1) * sizeof(wchar_t)));
-      RegCloseKey(hKey);
-    }
+    Wh_SetStringValue(L"LastPickedVideoPath", fileBuffer);
 
-    if (ownerWnd) {
+    if (ownerWnd && IsWindow(ownerWnd) &&
+        WaitForSingleObject(g_shutdownEvent, 0) != WAIT_OBJECT_0) {
       PostMessageW(ownerWnd, kMsgReloadSource, 0, 0);
     }
   }
@@ -1969,10 +1976,25 @@ DWORD WINAPI FilePickerThreadProc(LPVOID param) {
 }
 
 void PickAndLoadVideoViaDialogAsync(HWND ownerWnd) {
-  HANDLE hThread = CreateThread(nullptr, 0, FilePickerThreadProc, (LPVOID)ownerWnd, 0, nullptr);
-  if (hThread) {
-    CloseHandle(hThread);
+  if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
+    return;
+  if (g_pickerThread) {
+    if (WaitForSingleObject(g_pickerThread, 0) != WAIT_OBJECT_0)
+      return;
+    CloseHandle(g_pickerThread);
+    g_pickerThread = nullptr;
   }
+  g_pickerThread = CreateThread(nullptr, 0, FilePickerThreadProc,
+                                (LPVOID)ownerWnd, 0, &g_pickerThreadId);
+}
+
+BOOL CALLBACK ClosePickerDialog(HWND hwnd, LPARAM) {
+  wchar_t className[32];
+  if (GetClassNameW(hwnd, className, ARRAYSIZE(className)) &&
+      wcscmp(className, L"#32770") == 0) {
+    PostMessageW(hwnd, WM_CLOSE, 0, 0);
+  }
+  return TRUE;
 }
 
 void ReloadWallpaperSource() {
@@ -2015,12 +2037,37 @@ void ReloadWallpaperSource() {
 
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
-HANDLE g_threadReadyEvent = nullptr;
-std::atomic<bool> g_threadStarted{false};
+HANDLE g_messageQueueReadyEvent = nullptr;
+HMODULE g_modInstance = nullptr;
 bool g_mfStarted = false;
 bool g_comInitialized = false;
 
+void RegisterConfiguredHotkeys() {
+  UnregisterHotKey(g_wallpaperWnd, kHotkeyId);
+  UnregisterHotKey(g_wallpaperWnd, kVisibilityHotkeyId);
+  UnregisterHotKey(g_wallpaperWnd, kProfilerHotkeyId);
+  if (g_filePickerHotkey.load() &&
+      !RegisterHotKey(g_wallpaperWnd, kHotkeyId,
+                      MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G')) {
+    Wh_Log(L"File picker hotkey Ctrl+Alt+G is unavailable");
+  }
+  if (g_visibilityHotkey.load() &&
+      !RegisterHotKey(g_wallpaperWnd, kVisibilityHotkeyId,
+                      MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H')) {
+    Wh_Log(L"Visibility hotkey Ctrl+Alt+H is unavailable");
+  }
+  if (g_profilerHotkey.load() &&
+      !RegisterHotKey(g_wallpaperWnd, kProfilerHotkeyId,
+                      MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D')) {
+    Wh_Log(L"Profiler hotkey Ctrl+Alt+D is unavailable");
+  }
+}
+
 DWORD WINAPI WallpaperThreadProc(LPVOID) {
+  MSG startupMsg;
+  PeekMessageW(&startupMsg, nullptr, 0, 0, PM_NOREMOVE);
+  SetEvent(g_messageQueueReadyEvent);
+
   HRESULT comHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   g_comInitialized = SUCCEEDED(comHr);
   if (!g_comInitialized) {
@@ -2033,36 +2080,57 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
   if (!g_mfStarted) {
     Wh_Log(L"WallpaperThreadProc: MFStartup failed, hr=0x%08lX",
            (unsigned long)mfHr);
-    SetEvent(g_threadReadyEvent);
     if (g_comInitialized)
       CoUninitialize();
     return 1;
   }
 
   HWND progman = nullptr;
-  const int kProgmanMaxAttempts = 120; // ~60s worst case for slow boots
-  for (int attempt = 0; attempt < kProgmanMaxAttempts && !progman; attempt++) {
+  const int kProgmanMaxAttempts = 120;
+  for (int attempt = 0; attempt < kProgmanMaxAttempts; attempt++) {
+    if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
+      break;
+    HWND shellWindow = GetShellWindow();
+    if (shellWindow) {
+      DWORD shellPid = 0;
+      GetWindowThreadProcessId(shellWindow, &shellPid);
+      if (shellPid != GetCurrentProcessId()) {
+        Wh_Log(L"WallpaperThreadProc: this Explorer process does not own the desktop");
+        break;
+      }
+    }
     progman = FindWindowW(L"Progman", nullptr);
-    if (!progman)
-      Sleep(500);
+    if (progman && shellWindow)
+      break;
+    progman = nullptr;
+    if (WaitForSingleObject(g_shutdownEvent, 500) == WAIT_OBJECT_0)
+      break;
   }
   if (!progman) {
-    Wh_Log(L"WallpaperThreadProc: Progman not found after extended retry, "
-           L"falling back to top-level mode without WorkerW");
+    Wh_Log(L"WallpaperThreadProc: desktop is unavailable");
+    MFShutdown();
+    if (g_comInitialized)
+      CoUninitialize();
+    return 0;
   }
 
   HWND classicWorkerW = progman ? TryFindClassicWorkerWWithRetries(progman) : nullptr;
+  if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0) {
+    MFShutdown();
+    if (g_comInitialized)
+      CoUninitialize();
+    return 0;
+  }
   g_topLevelMode = (classicWorkerW == nullptr);
 
   WNDCLASSW wc = {};
   wc.lpfnWndProc = WallpaperWndProc;
-  wc.hInstance = GetModuleHandleW(nullptr);
+  wc.hInstance = g_modInstance;
   wc.lpszClassName = kWindowClassName;
   wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-  if (!RegisterClassW(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+  if (!RegisterClassW(&wc)) {
     Wh_Log(L"WallpaperThreadProc: failed to register window class, error=%lu",
            GetLastError());
-    SetEvent(g_threadReadyEvent);
     MFShutdown();
     if (g_comInitialized)
       CoUninitialize();
@@ -2107,13 +2175,12 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
 
   g_wallpaperWnd = CreateWindowExW(
       exStyle, kWindowClassName, L"VideoWallpaperEngine", style, x, y, width,
-      height, parentWnd, nullptr, GetModuleHandleW(nullptr), nullptr);
+      height, parentWnd, nullptr, g_modInstance, nullptr);
 
   if (!g_wallpaperWnd) {
     Wh_Log(L"WallpaperThreadProc: failed to create wallpaper window, error=%lu",
            GetLastError());
-    SetEvent(g_threadReadyEvent);
-    UnregisterClassW(kWindowClassName, GetModuleHandleW(nullptr));
+    UnregisterClassW(kWindowClassName, g_modInstance);
     MFShutdown();
     if (g_comInitialized)
       CoUninitialize();
@@ -2151,83 +2218,12 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
   }
 
-  bool hotkeyRegistered = false;
-  struct {
-    UINT mods;
-    UINT vk;
-    const wchar_t *label;
-  } hotkeyCandidates[] = {
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'G', L"Ctrl+Alt+G (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT, 'G', L"Ctrl+Alt+G"},
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT | MOD_SHIFT, 'G', L"Ctrl+Alt+Shift+G (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'G', L"Ctrl+Alt+Shift+G"},
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'W', L"Ctrl+Alt+W (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT, 'W', L"Ctrl+Alt+W"},
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT | MOD_SHIFT, 'W', L"Ctrl+Alt+Shift+W (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'W', L"Ctrl+Alt+Shift+W"},
-  };
-  for (const auto &hk : hotkeyCandidates) {
-    if (RegisterHotKey(g_wallpaperWnd, kHotkeyId, hk.mods, hk.vk)) {
-      Wh_Log(L"WallpaperThreadProc: registered file-picker hotkey %s",
-             hk.label);
-      hotkeyRegistered = true;
-      break;
-    }
-  }
-  if (!hotkeyRegistered) {
-    Wh_Log(L"WallpaperThreadProc: could not register ANY file-picker hotkey");
-  }
-
-  bool visibilityHotkeyRegistered = false;
-  struct {
-    UINT mods;
-    UINT vk;
-    const wchar_t *label;
-  } visibilityCandidates[] = {
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'H', L"Ctrl+Alt+H (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT, 'H', L"Ctrl+Alt+H"},
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT | MOD_SHIFT, 'H', L"Ctrl+Alt+Shift+H (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'H', L"Ctrl+Alt+Shift+H"},
-  };
-  for (const auto &hk : visibilityCandidates) {
-    if (RegisterHotKey(g_wallpaperWnd, kVisibilityHotkeyId, hk.mods, hk.vk)) {
-      Wh_Log(L"WallpaperThreadProc: registered visibility-toggle hotkey %s", hk.label);
-      visibilityHotkeyRegistered = true;
-      break;
-    }
-  }
-  if (!visibilityHotkeyRegistered) {
-    Wh_Log(L"WallpaperThreadProc: visibility-toggle hotkey unavailable, error=%lu", GetLastError());
-  }
-
-  bool profilerHotkeyRegistered = false;
-  struct {
-    UINT mods;
-    UINT vk;
-    const wchar_t *label;
-  } profilerCandidates[] = {
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'D', L"Ctrl+Alt+D (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT, 'D', L"Ctrl+Alt+D"},
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT | MOD_SHIFT, 'D', L"Ctrl+Alt+Shift+D (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT | MOD_SHIFT, 'D', L"Ctrl+Alt+Shift+D"},
-      {MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'P', L"Ctrl+Alt+P (NoRepeat)"},
-      {MOD_CONTROL | MOD_ALT, 'P', L"Ctrl+Alt+P"},
-  };
-  for (const auto &hk : profilerCandidates) {
-    if (RegisterHotKey(g_wallpaperWnd, kProfilerHotkeyId, hk.mods, hk.vk)) {
-      Wh_Log(L"WallpaperThreadProc: registered profiler-toggle hotkey %s", hk.label);
-      profilerHotkeyRegistered = true;
-      break;
-    }
-  }
-  if (!profilerHotkeyRegistered) {
-    Wh_Log(L"WallpaperThreadProc: profiler-toggle hotkey unavailable, error=%lu", GetLastError());
-  }
+  RegisterConfiguredHotkeys();
 
   ReloadWallpaperSource();
 
-  g_threadStarted.store(true);
-  SetEvent(g_threadReadyEvent);
+  if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
+    PostQuitMessage(0);
 
   MSG msg;
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -2237,6 +2233,7 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
       continue;
     }
     if (msg.message == kMsgUpdateSettings) {
+      RegisterConfiguredHotkeys();
       if (g_wallpaperWnd) {
         SetTimer(g_wallpaperWnd, kOcclusionTimerId, g_occlusionIntervalMs.load(), nullptr);
       }
@@ -2267,7 +2264,7 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
     DestroyWindow(g_wallpaperWnd);
     g_wallpaperWnd = nullptr;
   }
-  UnregisterClassW(kWindowClassName, GetModuleHandleW(nullptr));
+  UnregisterClassW(kWindowClassName, g_modInstance);
 
   if (g_mfStarted)
     MFShutdown();
@@ -2279,12 +2276,20 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
 
 BOOL Wh_ModInit() {
   Wh_Log(L"Init");
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&Wh_ModInit),
+                           &g_modInstance)) {
+    return FALSE;
+  }
   InitializeCriticalSection(&g_pathLock);
   LoadSettings();
 
-  g_threadReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-  if (!g_threadReadyEvent) {
-    Wh_Log(L"Failed to create wallpaper startup event, error=%lu", GetLastError());
+  g_shutdownEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_messageQueueReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!g_shutdownEvent || !g_messageQueueReadyEvent) {
+    if (g_shutdownEvent) CloseHandle(g_shutdownEvent);
+    if (g_messageQueueReadyEvent) CloseHandle(g_messageQueueReadyEvent);
     DeleteCriticalSection(&g_pathLock);
     return FALSE;
   }
@@ -2292,67 +2297,33 @@ BOOL Wh_ModInit() {
       CreateThread(nullptr, 0, WallpaperThreadProc, nullptr, 0, &g_threadId);
   if (!g_thread) {
     Wh_Log(L"Failed to create wallpaper thread, error=%lu", GetLastError());
-    CloseHandle(g_threadReadyEvent);
-    g_threadReadyEvent = nullptr;
+    CloseHandle(g_shutdownEvent);
+    CloseHandle(g_messageQueueReadyEvent);
     DeleteCriticalSection(&g_pathLock);
     return FALSE;
-  }
-
-  DWORD readyResult = WaitForSingleObject(g_threadReadyEvent, 90000);
-  CloseHandle(g_threadReadyEvent);
-  g_threadReadyEvent = nullptr;
-  if (readyResult == WAIT_OBJECT_0 && !g_threadStarted.load()) {
-    WaitForSingleObject(g_thread, INFINITE);
-    CloseHandle(g_thread);
-    g_thread = nullptr;
-    DeleteCriticalSection(&g_pathLock);
-    return FALSE;
-  }
-  if (readyResult != WAIT_OBJECT_0) {
-    Wh_Log(L"Wallpaper startup did not complete, wait result=%lu", readyResult);
   }
   return TRUE;
 }
 
 void Wh_ModUninit() {
   Wh_Log(L"Uninit");
-  static std::atomic<bool> s_uninitPending{false};
-  if (s_uninitPending.exchange(true)) {
-    Wh_Log(L"Wh_ModUninit: shutdown already pending or timed out previously, ignoring duplicate uninit request.");
-    return;
-  }
+  SetEvent(g_shutdownEvent);
   if (g_thread) {
+    WaitForSingleObject(g_messageQueueReadyEvent, INFINITE);
     PostThreadMessageW(g_threadId, WM_QUIT, 0, 0);
-    DWORD waitResult = WaitForSingleObject(g_thread, 3000);
-    if (waitResult == WAIT_TIMEOUT) {
-      // The thread did not exit -- it's very likely blocked inside a
-      // D3D/Media Foundation call in Tick() that never returned (see
-      // the device-loss handling above; this is the scenario that
-      // motivated it). We deliberately do NOT call TerminateThread()
-      // here: forcibly killing a thread mid-call inside a shared
-      // critical process like explorer.exe risks leaving D3D/COM/heap
-      // state corrupted in ways that are worse than a stuck thread --
-      // a stuck thread just sits there, a botched forced-terminate
-      // can take the whole process down harder than the original
-      // hang would have. Windows also cannot unload this DLL while
-      // this thread is still alive inside it, so Windhawk's own
-      // "Uninitializing..." will hang here too -- if you hit this,
-      // the only clean recovery is restarting explorer.exe (Task
-      // Manager -> Details -> explorer.exe -> Restart).
-      Wh_Log(L"Wh_ModUninit: wallpaper thread did not exit within 3s -- it is "
-             L"likely "
-             L"stuck in a blocking D3D/MF call. This DLL cannot be safely "
-             L"unloaded until "
-             L"that thread exits; restart explorer.exe to recover.");
-      // Do NOT delete the critical section on timeout: the stuck thread is still
-      // alive in explorer.exe and may later unblock and attempt to acquire
-      // g_pathLock inside ResolveVideoSource/GetVideoPathSetting. Deleting it
-      // while the thread exists risks an access violation crash.
-      return; // don't touch g_thread/g_threadId -- the thread is still alive
-    }
+    WaitForSingleObject(g_thread, INFINITE);
     CloseHandle(g_thread);
     g_thread = nullptr;
   }
+  if (g_pickerThread) {
+    while (WaitForSingleObject(g_pickerThread, 100) == WAIT_TIMEOUT) {
+      EnumThreadWindows(g_pickerThreadId, ClosePickerDialog, 0);
+    }
+    CloseHandle(g_pickerThread);
+    g_pickerThread = nullptr;
+  }
+  CloseHandle(g_messageQueueReadyEvent);
+  CloseHandle(g_shutdownEvent);
   DeleteCriticalSection(&g_pathLock);
 }
 

@@ -72,15 +72,15 @@ WindowsState s_winState = {};
 ResourceStats s_resourceStats = {};
 
 // DXGI adapter reference for VRAM queries
-ComPtr<IDXGIAdapter3> s_dxgiAdapter3;
+[[clang::no_destroy]] ComPtr<IDXGIAdapter3> s_dxgiAdapter3;
 
 // Cached D3D11 device and offscreen texture for overlay rendering when backbuffer is flip-model
-ComPtr<ID3D11Device> s_d3dDevice;
-ComPtr<ID3D11DeviceContext> s_d3dContext;
-ComPtr<ID3D11Texture2D> s_overlayTexture;
+[[clang::no_destroy]] ComPtr<ID3D11Device> s_d3dDevice;
+[[clang::no_destroy]] ComPtr<ID3D11DeviceContext> s_d3dContext;
+[[clang::no_destroy]] ComPtr<ID3D11Texture2D> s_overlayTexture;
 
 // Cached overlay lines and font handle for GDI/DXGI rendering
-static struct OverlayCache {
+struct OverlayCache {
   struct Line {
     wchar_t text[128];
     COLORREF color;
@@ -95,7 +95,8 @@ static struct OverlayCache {
       hFont = nullptr;
     }
   }
-} s_overlayCache;
+};
+[[clang::no_destroy]] OverlayCache s_overlayCache;
 
 // Helper to retrieve or register a section by name without allocations
 SectionTimer *GetOrRegisterSection(const char *name) {
@@ -406,7 +407,7 @@ void Profiler::UpdateWindowsStateImpl(bool fullscreenPaused,
   s_winState.batteryPauseActive = batteryPaused;
   s_winState.sessionPauseActive = sessionPaused;
   s_winState.wallpaperHidden = hidden;
-  s_winState.batteryPct = onBattery ? 50 : -1; // -1 represents AC power
+  s_winState.batteryPct = onBattery ? 0 : -1; // Only the power source is tracked.
 }
 
 void Profiler::UpdateResourceStatsImpl(int textures, int swapChains,
@@ -538,8 +539,8 @@ void Profiler::DrawOverlay(HWND hwnd, ID3D11Texture2D *targetTexture) {
     AddLine(L"Performance", clrHeader);
     AddLine(L"---------------------------------------------", clrHeader);
     const wchar_t *fpsTag = (s_renderStats.actualFPS >= 28.0f)
-                                ? L"[🟢 Good]"
-                                : ((s_renderStats.actualFPS >= 20.0f) ? L"[🟡 Warn]" : L"[🔴 Crit]");
+                                ? L"[OK Good]"
+                                : ((s_renderStats.actualFPS >= 20.0f) ? L"[WARN Warn]" : L"[CRIT Crit]");
     COLORREF fpsClr = (s_renderStats.actualFPS >= 28.0f)
                           ? clrGood
                           : ((s_renderStats.actualFPS >= 20.0f) ? clrWarn : clrCrit);
@@ -548,8 +549,8 @@ void Profiler::DrawOverlay(HWND hwnd, ID3D11Texture2D *targetTexture) {
     AddLine(lBuf, fpsClr);
 
     const wchar_t *ftTag = (s_renderStats.avgFrameTimeMs <= 18.0f)
-                               ? L"[🟢 Good]"
-                               : ((s_renderStats.avgFrameTimeMs <= 33.0f) ? L"[🟡 Warn]" : L"[🔴 Crit]");
+                               ? L"[OK Good]"
+                               : ((s_renderStats.avgFrameTimeMs <= 33.0f) ? L"[WARN Warn]" : L"[CRIT Crit]");
     COLORREF ftClr = (s_renderStats.avgFrameTimeMs <= 18.0f)
                          ? clrGood
                          : ((s_renderStats.avgFrameTimeMs <= 33.0f) ? clrWarn : clrCrit);
@@ -558,8 +559,8 @@ void Profiler::DrawOverlay(HWND hwnd, ID3D11Texture2D *targetTexture) {
     AddLine(lBuf, ftClr);
 
     const wchar_t *crTag = (s_renderStats.cpuRenderTimeMs <= 8.0f)
-                               ? L"[🟢 Good]"
-                               : ((s_renderStats.cpuRenderTimeMs <= 15.0f) ? L"[🟡 Warn]" : L"[🔴 Crit]");
+                               ? L"[OK Good]"
+                               : ((s_renderStats.cpuRenderTimeMs <= 15.0f) ? L"[WARN Warn]" : L"[CRIT Crit]");
     COLORREF crClr = (s_renderStats.cpuRenderTimeMs <= 8.0f)
                          ? clrGood
                          : ((s_renderStats.cpuRenderTimeMs <= 15.0f) ? clrWarn : clrCrit);
@@ -567,8 +568,8 @@ void Profiler::DrawOverlay(HWND hwnd, ID3D11Texture2D *targetTexture) {
     AddLine(lBuf, crClr);
 
     const wchar_t *cpuTag = (s_cpuStats.explorerProcessPct <= 3.0f)
-                                ? L"[🟢 Good]"
-                                : ((s_cpuStats.explorerProcessPct <= 6.0f) ? L"[🟡 Warn]" : L"[🔴 Crit]");
+                                ? L"[OK Good]"
+                                : ((s_cpuStats.explorerProcessPct <= 6.0f) ? L"[WARN Warn]" : L"[CRIT Crit]");
     COLORREF cpuClr = (s_cpuStats.explorerProcessPct <= 3.0f)
                           ? clrGood
                           : ((s_cpuStats.explorerProcessPct <= 6.0f) ? clrWarn : clrCrit);
@@ -585,7 +586,7 @@ void Profiler::DrawOverlay(HWND hwnd, ID3D11Texture2D *targetTexture) {
     AddLine(lBuf, clrText);
 
     UINT64 wsMB = s_memStats.workingSetBytes / (1024 * 1024);
-    const wchar_t *memTag = (wsMB <= 150) ? L"[🟢 Good]" : ((wsMB <= 300) ? L"[🟡 Warn]" : L"[🔴 Crit]");
+    const wchar_t *memTag = (wsMB <= 150) ? L"[OK Good]" : ((wsMB <= 300) ? L"[WARN Warn]" : L"[CRIT Crit]");
     COLORREF memClr = (wsMB <= 150) ? clrGood : ((wsMB <= 300) ? clrWarn : clrCrit);
     _snwprintf(lBuf, 127, L"Working Set: %llu MB (Commit: %llu MB) %s", wsMB,
                s_memStats.commitSizeBytes / (1024 * 1024), memTag);
@@ -614,23 +615,23 @@ void Profiler::DrawOverlay(HWND hwnd, ID3D11Texture2D *targetTexture) {
                pauseReason,
                s_winState.batteryPct < 0 ? L"AC" : L"Battery");
     AddLine(lBuf, clrText);
-    _snwprintf(lBuf, 127, L"Video:       %dx%d %.0f FPS %s", s_videoStats.width, s_videoStats.height,
-               s_videoStats.fps, s_videoStats.codec);
+    _snwprintf(lBuf, 127, L"Video:       %dx%d (%s)", s_videoStats.width,
+               s_videoStats.height, s_videoStats.codec);
     AddLine(lBuf, clrText);
     _snwprintf(lBuf, 127, L"Recoveries:  %u | Reloads: %u | Dropped: %llu",
                s_deviceHealth.recoveryCount, s_deviceHealth.reloadCount, s_renderStats.missedFrames);
     AddLine(lBuf, clrText);
 
-    const wchar_t *boundStr = L"✓ Decode | ✗ CPU | ✗ GPU (Optimal / 60 FPS Sync)";
+    const wchar_t *boundStr = L"YES Decode | NO CPU | NO GPU (Optimal / 60 FPS Sync)";
     COLORREF boundClr = clrGood;
     if (decodeMs > 5.0f || transferMs > 4.0f) {
-      boundStr = L"✓ Decode (Waiting on MF) | ✗ CPU | ✗ GPU";
+      boundStr = L"YES Decode (Waiting on MF) | NO CPU | NO GPU";
       boundClr = clrWarn;
     } else if (presentMs > 10.0f) {
-      boundStr = L"✗ Decode | ✗ CPU | ✓ GPU (Present Blocked by DWM)";
+      boundStr = L"NO Decode | NO CPU | YES GPU (Present Blocked by DWM)";
       boundClr = clrWarn;
     } else if (s_renderStats.cpuRenderTimeMs > 15.0f) {
-      boundStr = L"✗ Decode | ✓ CPU | ✗ GPU";
+      boundStr = L"NO Decode | YES CPU | NO GPU";
       boundClr = clrWarn;
     }
     _snwprintf(lBuf, 127, L"Bound By:    %s", boundStr);
@@ -639,10 +640,10 @@ void Profiler::DrawOverlay(HWND hwnd, ID3D11Texture2D *targetTexture) {
 
     AddLine(L"Resources & Lifetime", clrHeader);
     AddLine(L"---------------------------------------------", clrHeader);
-    _snwprintf(lBuf, 127, L"Textures:    %u | Swapchains: %u | Surfaces: %u",
-               s_resourceStats.textures, s_resourceStats.swapChains, s_resourceStats.videoSurfaces);
+    _snwprintf(lBuf, 127, L"Tracked textures: %u | Swapchains: %u",
+               s_resourceStats.textures, s_resourceStats.swapChains);
     AddLine(lBuf, clrText);
-    _snwprintf(lBuf, 127, L"Engines:     %u | Live COM Objects: %u",
+    _snwprintf(lBuf, 127, L"Engines:     %u | Tracked COM refs: %u",
                s_resourceStats.mediaEngines, s_resourceStats.liveComObjects);
     AddLine(lBuf, clrText);
     AddLine(L"", clrText);

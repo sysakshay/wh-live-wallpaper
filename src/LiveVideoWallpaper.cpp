@@ -2016,6 +2016,7 @@ void ReloadWallpaperSource() {
 HANDLE g_thread = nullptr;
 DWORD g_threadId = 0;
 HANDLE g_threadReadyEvent = nullptr;
+std::atomic<bool> g_threadStarted{false};
 bool g_mfStarted = false;
 bool g_comInitialized = false;
 
@@ -2225,6 +2226,7 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
 
   ReloadWallpaperSource();
 
+  g_threadStarted.store(true);
   SetEvent(g_threadReadyEvent);
 
   MSG msg;
@@ -2281,18 +2283,34 @@ BOOL Wh_ModInit() {
   LoadSettings();
 
   g_threadReadyEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  if (!g_threadReadyEvent) {
+    Wh_Log(L"Failed to create wallpaper startup event, error=%lu", GetLastError());
+    DeleteCriticalSection(&g_pathLock);
+    return FALSE;
+  }
   g_thread =
       CreateThread(nullptr, 0, WallpaperThreadProc, nullptr, 0, &g_threadId);
   if (!g_thread) {
     Wh_Log(L"Failed to create wallpaper thread, error=%lu", GetLastError());
     CloseHandle(g_threadReadyEvent);
     g_threadReadyEvent = nullptr;
+    DeleteCriticalSection(&g_pathLock);
     return FALSE;
   }
 
-  WaitForSingleObject(g_threadReadyEvent, 10000);
+  DWORD readyResult = WaitForSingleObject(g_threadReadyEvent, 90000);
   CloseHandle(g_threadReadyEvent);
   g_threadReadyEvent = nullptr;
+  if (readyResult == WAIT_OBJECT_0 && !g_threadStarted.load()) {
+    WaitForSingleObject(g_thread, INFINITE);
+    CloseHandle(g_thread);
+    g_thread = nullptr;
+    DeleteCriticalSection(&g_pathLock);
+    return FALSE;
+  }
+  if (readyResult != WAIT_OBJECT_0) {
+    Wh_Log(L"Wallpaper startup did not complete, wait result=%lu", readyResult);
+  }
   return TRUE;
 }
 

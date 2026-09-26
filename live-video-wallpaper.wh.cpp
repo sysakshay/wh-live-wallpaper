@@ -88,6 +88,12 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
 // clang-format off
 // ==WindhawkModSettings==
 /*
+- wallpaperMode: video
+  $name: Wallpaper mode
+  $description: Master switch -- what to render as your desktop wallpaper.
+  $options:
+  - video: Video (play an MP4 file)
+  - fluid: Fluid Simulation (By WasiXGamer)
 - videoPath: ""
   $name: Local video path
   $description: Full path to an .mp4 file on disk. Tip -- press Ctrl+Alt+G in the desktop to pick a file interactively instead of typing a path here.
@@ -144,6 +150,21 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
   $name: Enable Ctrl+Alt+H visibility hotkey
 - profilerHotkey: false
   $name: Enable Ctrl+Alt+D profiler hotkey
+- fluidSplatRadius: 25
+  $name: Fluid - Splat radius (blob size)
+  $description: Controls the size of fluid blobs (0 = tiny, 100 = huge).
+- fluidSpeed: 100
+  $name: Fluid - Speed
+  $description: How fast the fluid moves (0 = slow, 200 = fast, default 100).
+- fluidBloom: 80
+  $name: Fluid - Bloom intensity
+  $description: Glow around bright fluid areas (0 = none, 200 = max, default 80).
+- fluidColorful: true
+  $name: Fluid - Colorful
+  $description: When on, splats use random vivid hues. When off, splats use a fixed cyan color.
+- fluidRandomSplatsInterval: 2
+  $name: Fluid - Random splats interval (seconds)
+  $description: How often random ambient splats appear, in seconds (0 = disabled).
 */
 // ==/WindhawkModSettings==
 // clang-format on
@@ -154,7 +175,9 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
 // ============================================================================
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <commdlg.h>
+#include <cstdlib>
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <dxgi1_2.h>
@@ -1509,6 +1532,7 @@ const wchar_t kWindowClassName[] = L"VideoWallpaperEngine_WorkerWindow";
 const UINT kMsgReloadSource = WM_APP + 1;
 const UINT kMsgMediaEngineEvent = WM_APP + 2;
 const UINT kMsgUpdateSettings = WM_APP + 3;
+const UINT kMsgModeChanged = WM_APP + 4;
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -1529,6 +1553,20 @@ CRITICAL_SECTION g_pathLock;
 std::wstring g_videoPath;
 std::atomic<int> g_fitMode{0}; // 0 = fill/stretch, 1 = cover/zoom, 2 = fit/letterbox
 std::atomic<BatteryMode> g_batteryMode{BatteryMode::Pause};
+
+// Which subsystem (VideoPlayer vs FluidSimulation) drives the shared D3D
+// device/swap chain. Read on the wallpaper thread every render tick,
+// written from Wh_ModSettingsChanged.
+enum class WallpaperMode { Video, Fluid };
+std::atomic<WallpaperMode> g_wallpaperMode{WallpaperMode::Video};
+
+// Fluid-mode customization settings -- read every frame off the wallpaper
+// thread, written from Wh_ModSettingsChanged.
+std::atomic<int>  g_fluidSplatRadius{25};          // 0-100
+std::atomic<int>  g_fluidSpeed{100};               // 0-200
+std::atomic<int>  g_fluidBloom{80};                // 0-200
+std::atomic<bool> g_fluidColorful{true};
+std::atomic<int>  g_fluidRandomSplatsInterval{2};  // seconds, 0 = disabled
 std::atomic<int> g_targetFps{60};
 std::atomic<bool> g_audioMuted{true};
 std::atomic<int> g_audioVolume{100};
@@ -1653,8 +1691,1501 @@ std::wstring LoadSettings() {
   g_visibilityHotkey = Wh_GetIntSetting(L"visibilityHotkey") != 0;
   g_profilerHotkey = Wh_GetIntSetting(L"profilerHotkey") != 0;
 
+  PCWSTR wallpaperModeStr = Wh_GetStringSetting(L"wallpaperMode");
+  WallpaperMode newWallpaperMode = WallpaperMode::Video;
+  if (wallpaperModeStr) {
+    if (wcscmp(wallpaperModeStr, L"fluid") == 0)
+      newWallpaperMode = WallpaperMode::Fluid;
+    Wh_FreeStringSetting(wallpaperModeStr);
+  }
+  g_wallpaperMode = newWallpaperMode;
+
+  int fluidSplatRadiusInt = Wh_GetIntSetting(L"fluidSplatRadius");
+  g_fluidSplatRadius = (std::max)(0, (std::min)(100, fluidSplatRadiusInt));
+
+  int fluidSpeedInt = Wh_GetIntSetting(L"fluidSpeed");
+  g_fluidSpeed = (std::max)(0, (std::min)(200, fluidSpeedInt));
+
+  int fluidBloomInt = Wh_GetIntSetting(L"fluidBloom");
+  g_fluidBloom = (std::max)(0, (std::min)(200, fluidBloomInt));
+
+  g_fluidColorful = Wh_GetIntSetting(L"fluidColorful") != 0;
+
+  int fluidRandomSplatsIntervalInt = Wh_GetIntSetting(L"fluidRandomSplatsInterval");
+  g_fluidRandomSplatsInterval = (std::max)(0, fluidRandomSplatsIntervalInt);
+
   LeaveCriticalSection(&g_pathLock);
   return oldPath;
+}
+
+// ============================================================================
+// Fluid Simulation Subsystem
+// Interactive GPU fluid-simulation wallpaper mode (experimental)
+// ============================================================================
+// A real-time, mouse-reactive fluid sim (semi-Lagrangian advection + Jacobi
+// pressure projection + vorticity confinement -- the standard "Stable
+// Fluids" method) implemented as Direct3D 11 compute shaders, rendered as an
+// alternative to video playback on the SAME shared D3D11 device/swap chain
+// that VideoPlayer::InitD3DAndSwapChain already sets up.
+//
+// Pipeline per tick:
+//   1. Splat  - inject a velocity + dye impulse at the cursor
+//   2. Advect velocity (self-advection)
+//   3. Curl + vorticity confinement
+//   4. Divergence
+//   5. Pressure solve (Jacobi, warm-started)
+//   6. Gradient subtract (projection -> divergence-free)
+//   7. Advect dye
+//   8. Composite: draw dye field to the swap chain back buffer
+// ============================================================================
+
+typedef HRESULT(WINAPI *PFN_D3DCOMPILE)(LPCVOID pSrcData, SIZE_T SrcDataSize,
+                                        LPCSTR pSourceName, LPCVOID pDefines,
+                                        LPCVOID pInclude, LPCSTR pEntrypoint,
+                                        LPCSTR pTarget, UINT Flags1,
+                                        UINT Flags2, ID3DBlob **ppCode,
+                                        ID3DBlob **ppErrorMsgs);
+
+static PFN_D3DCOMPILE GetD3DCompileFn() {
+  static PFN_D3DCOMPILE fn = nullptr;
+  static bool attempted = false;
+  if (!attempted) {
+    attempted = true;
+    const wchar_t *candidates[] = {L"d3dcompiler_47.dll", L"d3dcompiler_46.dll",
+                                   L"d3dcompiler_43.dll"};
+    for (const wchar_t *name : candidates) {
+      HMODULE mod = LoadLibraryW(name);
+      if (mod) {
+        fn = reinterpret_cast<PFN_D3DCOMPILE>(GetProcAddress(mod, "D3DCompile"));
+        if (fn)
+          break;
+      }
+    }
+  }
+  return fn;
+}
+
+static ComPtr<ID3DBlob> FluidCompileShaderBlob(const char *source, size_t sourceLen,
+                                               const char *entryPoint,
+                                               const char *target) {
+  PFN_D3DCOMPILE d3dCompile = GetD3DCompileFn();
+  if (!d3dCompile) {
+    Wh_Log(L"FluidSimulation: d3dcompiler_47.dll / D3DCompile not available");
+    return ComPtr<ID3DBlob>();
+  }
+  ComPtr<ID3DBlob> code;
+  ComPtr<ID3DBlob> errors;
+  HRESULT hr = d3dCompile(source, sourceLen, nullptr, nullptr, nullptr,
+                          entryPoint, target, 0, 0, &code, &errors);
+  if (FAILED(hr)) {
+    if (errors.Get()) {
+      Wh_Log(L"FluidSimulation: shader compile error (%hs/%hs): %hs", entryPoint,
+             target, (const char *)errors->GetBufferPointer());
+    } else {
+      Wh_Log(L"FluidSimulation: shader compile failed (%hs/%hs), hr=0x%08lX",
+             entryPoint, target, (unsigned long)hr);
+    }
+    return ComPtr<ID3DBlob>();
+  }
+  return code;
+}
+
+struct SimTexture {
+  ComPtr<ID3D11Texture2D> tex;
+  ComPtr<ID3D11ShaderResourceView> srv;
+  ComPtr<ID3D11UnorderedAccessView> uav;
+
+  void Reset() {
+    tex.Reset();
+    srv.Reset();
+    uav.Reset();
+  }
+};
+
+static bool CreateSimTexture(ID3D11Device *device, int w, int h, SimTexture &out) {
+  out.Reset();
+  D3D11_TEXTURE2D_DESC desc = {};
+  desc.Width = (UINT)w;
+  desc.Height = (UINT)h;
+  desc.MipLevels = 1;
+  desc.ArraySize = 1;
+  desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  desc.SampleDesc.Count = 1;
+  desc.Usage = D3D11_USAGE_DEFAULT;
+  desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+  HRESULT hr = device->CreateTexture2D(&desc, nullptr, &out.tex);
+  if (FAILED(hr))
+    return false;
+  hr = device->CreateShaderResourceView(out.tex.Get(), nullptr, &out.srv);
+  if (FAILED(hr))
+    return false;
+  hr = device->CreateUnorderedAccessView(out.tex.Get(), nullptr, &out.uav);
+  if (FAILED(hr))
+    return false;
+  return true;
+}
+
+static void FluidUnbindCSUAVs(ID3D11DeviceContext *ctx, UINT startSlot, UINT count) {
+  static ID3D11UnorderedAccessView *const nullUAVs[8] = {
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  ctx->CSSetUnorderedAccessViews(startSlot, (std::min)(count, 8u), nullUAVs, nullptr);
+}
+
+static void FluidUnbindCSSRVs(ID3D11DeviceContext *ctx, UINT startSlot, UINT count) {
+  static ID3D11ShaderResourceView *const nullSRVs[8] = {
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+  ctx->CSSetShaderResources(startSlot, (std::min)(count, 8u), nullSRVs);
+}
+
+static void FluidHsvToRgb(float h, float s, float v, float &r, float &g, float &b) {
+  float i = floorf(h * 6.0f);
+  float f = h * 6.0f - i;
+  float p = v * (1.0f - s);
+  float q = v * (1.0f - f * s);
+  float t = v * (1.0f - (1.0f - f) * s);
+  int im = ((int)i) % 6;
+  if (im < 0)
+    im += 6;
+  switch (im) {
+  case 0: r = v; g = t; b = p; break;
+  case 1: r = q; g = v; b = p; break;
+  case 2: r = p; g = v; b = t; break;
+  case 3: r = p; g = q; b = v; break;
+  case 4: r = t; g = p; b = v; break;
+  default: r = v; g = p; b = q; break;
+  }
+}
+
+struct FluidSimParamsCB {
+  float dt;
+  float dissipation;
+  float clearValue;
+  float pad0;
+  float simTexelX;
+  float simTexelY;
+  float pad1;
+  float pad2;
+};
+
+struct FluidSplatParamsCB {
+  float pointX, pointY, pad0, pad1;
+  float value0, value1, value2, value3;
+  float radiusSq, aspectRatio, pad2, pad3;
+};
+
+struct FluidVorticityParamsCB {
+  float curl;
+  float dt;
+  float pad0;
+  float pad1;
+};
+
+struct FluidBloomParamsCB {
+  float intensity, threshold, curve0, curve1;
+  float curve2, pad0, pad1, pad2;
+  float texelSizeX, texelSizeY, pad3, pad4;
+};
+
+static const char kFluidShaderSource[] = R"HLSL(
+SamplerState LinearClamp : register(s0);
+
+cbuffer SimParams : register(b0)
+{
+    float4 simParams;
+    float4 simTexelSize;
+};
+
+cbuffer SplatParams : register(b1)
+{
+    float4 splatPoint;
+    float4 splatValue;
+    float4 splatParams;
+};
+
+cbuffer VorticityParams : register(b2)
+{
+    float4 vorticityParams;
+};
+
+cbuffer BloomParams : register(b3)
+{
+    float4 bloomParams;
+    float4 bloomParams2;
+    float4 bloomTexelSize;
+};
+
+int2 ClampCoord(int2 c, int2 dims)
+{
+    return clamp(c, int2(0, 0), dims - int2(1, 1));
+}
+
+Texture2D<float4> splatSrc : register(t0);
+RWTexture2D<float4> splatDst : register(u0);
+
+[numthreads(8, 8, 1)]
+void SplatCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    splatDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float2 uv = (float2(id.xy) + 0.5) / float2((float)w, (float)h);
+    float2 p = uv - splatPoint.xy;
+    p.x *= splatParams.y;
+    float falloff = exp(-dot(p, p) / max(splatParams.x, 1e-6));
+    float4 base = splatSrc.Load(int3(int2(id.xy), 0));
+    splatDst[id.xy] = base + splatValue * falloff;
+}
+
+Texture2D<float4> advectVelocityField : register(t1);
+Texture2D<float4> advectSourceField : register(t2);
+RWTexture2D<float4> advectDest : register(u1);
+
+[numthreads(8, 8, 1)]
+void AdvectCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    advectDest.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float2 uv = (float2(id.xy) + 0.5) / float2((float)w, (float)h);
+    float2 vel = advectVelocityField.SampleLevel(LinearClamp, uv, 0).xy;
+    float2 backUv = uv - simParams.x * vel * simTexelSize.xy;
+    float4 result = advectSourceField.SampleLevel(LinearClamp, backUv, 0);
+    float decay = 1.0 + simParams.y * simParams.x;
+    advectDest[id.xy] = result / decay;
+}
+
+Texture2D<float4> divVelocityField : register(t3);
+RWTexture2D<float4> divDest : register(u2);
+
+[numthreads(8, 8, 1)]
+void DivergenceCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    divDest.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    int2 dims = int2(w, h);
+    int2 c = int2(id.xy);
+
+    float L = divVelocityField.Load(int3(ClampCoord(c + int2(-1, 0), dims), 0)).x;
+    float R = divVelocityField.Load(int3(ClampCoord(c + int2( 1, 0), dims), 0)).x;
+    float T = divVelocityField.Load(int3(ClampCoord(c + int2( 0, 1), dims), 0)).y;
+    float B = divVelocityField.Load(int3(ClampCoord(c + int2( 0,-1), dims), 0)).y;
+    float2 C = divVelocityField.Load(int3(c, 0)).xy;
+
+    if (c.x == 0)       L = -C.x;
+    if (c.x == w - 1)   R = -C.x;
+    if (c.y == h - 1)   T = -C.y;
+    if (c.y == 0)       B = -C.y;
+
+    divDest[id.xy] = float4(0.5 * (R - L + T - B), 0, 0, 0);
+}
+
+Texture2D<float4> jacobiPressureField : register(t4);
+Texture2D<float4> jacobiDivergenceField : register(t5);
+RWTexture2D<float4> jacobiDest : register(u3);
+
+[numthreads(8, 8, 1)]
+void PressureJacobiCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    jacobiDest.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    int2 dims = int2(w, h);
+    int2 c = int2(id.xy);
+
+    float L = jacobiPressureField.Load(int3(ClampCoord(c + int2(-1, 0), dims), 0)).x;
+    float R = jacobiPressureField.Load(int3(ClampCoord(c + int2( 1, 0), dims), 0)).x;
+    float B = jacobiPressureField.Load(int3(ClampCoord(c + int2( 0,-1), dims), 0)).x;
+    float T = jacobiPressureField.Load(int3(ClampCoord(c + int2( 0, 1), dims), 0)).x;
+    float div = jacobiDivergenceField.Load(int3(c, 0)).x;
+
+    jacobiDest[id.xy] = float4((L + R + B + T - div) * 0.25, 0, 0, 0);
+}
+
+Texture2D<float4> gradVelocitySrc : register(t6);
+Texture2D<float4> gradPressureField : register(t7);
+RWTexture2D<float4> gradVelocityDst : register(u4);
+
+[numthreads(8, 8, 1)]
+void GradientSubtractCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    gradVelocityDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    int2 dims = int2(w, h);
+    int2 c = int2(id.xy);
+
+    float L = gradPressureField.Load(int3(ClampCoord(c + int2(-1, 0), dims), 0)).x;
+    float R = gradPressureField.Load(int3(ClampCoord(c + int2( 1, 0), dims), 0)).x;
+    float B = gradPressureField.Load(int3(ClampCoord(c + int2( 0,-1), dims), 0)).x;
+    float T = gradPressureField.Load(int3(ClampCoord(c + int2( 0, 1), dims), 0)).x;
+
+    float4 vel = gradVelocitySrc.Load(int3(c, 0));
+    vel.xy -= float2(R - L, T - B);
+    gradVelocityDst[id.xy] = vel;
+}
+
+Texture2D<float4> curlVelocityField : register(t8);
+RWTexture2D<float4> curlDest : register(u5);
+
+[numthreads(8, 8, 1)]
+void CurlCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    curlDest.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    int2 dims = int2(w, h);
+    int2 c = int2(id.xy);
+
+    float L = curlVelocityField.Load(int3(ClampCoord(c + int2(-1, 0), dims), 0)).y;
+    float R = curlVelocityField.Load(int3(ClampCoord(c + int2( 1, 0), dims), 0)).y;
+    float T = curlVelocityField.Load(int3(ClampCoord(c + int2( 0, 1), dims), 0)).x;
+    float B = curlVelocityField.Load(int3(ClampCoord(c + int2( 0,-1), dims), 0)).x;
+
+    curlDest[id.xy] = float4(0.5 * (R - L - T + B), 0, 0, 0);
+}
+
+Texture2D<float4> vortVelocitySrc : register(t9);
+Texture2D<float4> vortCurlField : register(t10);
+RWTexture2D<float4> vortVelocityDst : register(u6);
+
+[numthreads(8, 8, 1)]
+void VorticityCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    vortVelocityDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    int2 dims = int2(w, h);
+    int2 c = int2(id.xy);
+
+    float L = vortCurlField.Load(int3(ClampCoord(c + int2(-1, 0), dims), 0)).x;
+    float R = vortCurlField.Load(int3(ClampCoord(c + int2( 1, 0), dims), 0)).x;
+    float T = vortCurlField.Load(int3(ClampCoord(c + int2( 0, 1), dims), 0)).x;
+    float B = vortCurlField.Load(int3(ClampCoord(c + int2( 0,-1), dims), 0)).x;
+    float C = vortCurlField.Load(int3(c, 0)).x;
+
+    float2 force = 0.5 * float2(abs(T) - abs(B), abs(R) - abs(L));
+    force /= length(force) + 0.0001;
+    force *= vorticityParams.x * C;
+    force.y *= -1.0;
+
+    float4 vel = vortVelocitySrc.Load(int3(c, 0));
+    vel.xy += force * vorticityParams.y;
+    vel.xy = clamp(vel.xy, -1000.0, 1000.0);
+
+    vortVelocityDst[id.xy] = vel;
+}
+
+Texture2D<float4> clearSrc : register(t12);
+RWTexture2D<float4> clearDst : register(u7);
+
+[numthreads(8, 8, 1)]
+void ClearCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    clearDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float4 v = clearSrc.Load(int3(int2(id.xy), 0));
+    clearDst[id.xy] = v * simParams.z;
+}
+
+Texture2D<float4> bloomSrc : register(t11);
+RWTexture2D<float4> bloomDst : register(u7);
+
+[numthreads(8, 8, 1)]
+void BloomPrefilterCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    bloomDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float2 uv = (float2(id.xy) + 0.5) / float2((float)w, (float)h);
+    float3 c = bloomSrc.SampleLevel(LinearClamp, uv, 0).rgb;
+    float br = max(c.r, max(c.g, c.b));
+    float rq = clamp(br - bloomParams.z, 0.0, bloomParams.w);
+    rq = bloomParams2.x * rq * rq;
+    c *= max(rq, br - bloomParams.y) / max(br, 0.0001);
+    bloomDst[id.xy] = float4(c, 0);
+}
+
+[numthreads(8, 8, 1)]
+void BloomBlurCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    bloomDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float2 uv = (float2(id.xy) + 0.5) / float2((float)w, (float)h);
+    float2 t = bloomTexelSize.xy;
+    float4 sum = bloomSrc.SampleLevel(LinearClamp, uv + float2(-t.x, -t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2( t.x, -t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2(-t.x,  t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2( t.x,  t.y), 0);
+    bloomDst[id.xy] = sum * 0.25;
+}
+
+[numthreads(8, 8, 1)]
+void BloomUpsampleCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    bloomDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float2 uv = (float2(id.xy) + 0.5) / float2((float)w, (float)h);
+    float2 t = bloomTexelSize.xy;
+    float4 sum = bloomSrc.SampleLevel(LinearClamp, uv + float2(-t.x, -t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2( t.x, -t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2(-t.x,  t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2( t.x,  t.y), 0);
+    sum *= 0.25;
+    float4 dst = bloomDst.Load(int3(int2(id.xy), 0));
+    bloomDst[id.xy] = dst + sum;
+}
+
+[numthreads(8, 8, 1)]
+void BloomFinalCS(uint3 id : SV_DispatchThreadID)
+{
+    uint w, h;
+    bloomDst.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    float2 uv = (float2(id.xy) + 0.5) / float2((float)w, (float)h);
+    float2 t = bloomTexelSize.xy;
+    float4 sum = bloomSrc.SampleLevel(LinearClamp, uv + float2(-t.x, -t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2( t.x, -t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2(-t.x,  t.y), 0)
+               + bloomSrc.SampleLevel(LinearClamp, uv + float2( t.x,  t.y), 0);
+    bloomDst[id.xy] = sum * 0.25 * bloomParams.x;
+}
+
+struct VSOut
+{
+    float4 pos : SV_POSITION;
+    float2 uv  : TEXCOORD0;
+};
+
+VSOut FullscreenVS(uint id : SV_VertexID)
+{
+    VSOut o;
+    float2 p = float2((id << 1) & 2, id & 2);
+    o.uv = p;
+    o.pos = float4(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 0, 1);
+    return o;
+}
+
+Texture2D<float4> compositeDyeTex : register(t13);
+Texture2D<float4> compositeBloomTex : register(t14);
+
+float4 CompositePS(VSOut i) : SV_TARGET
+{
+    uint texW, texH;
+    compositeDyeTex.GetDimensions(texW, texH);
+    float2 texel = 1.0 / float2((float)texW, (float)texH);
+
+    float3 base = compositeDyeTex.SampleLevel(LinearClamp, i.uv, 0).rgb;
+
+    float3 lc = compositeDyeTex.SampleLevel(LinearClamp, i.uv - float2(texel.x, 0), 0).rgb;
+    float3 rc = compositeDyeTex.SampleLevel(LinearClamp, i.uv + float2(texel.x, 0), 0).rgb;
+    float3 tc = compositeDyeTex.SampleLevel(LinearClamp, i.uv + float2(0, texel.y), 0).rgb;
+    float3 bc = compositeDyeTex.SampleLevel(LinearClamp, i.uv - float2(0, texel.y), 0).rgb;
+    float dx = length(rc) - length(lc);
+    float dy = length(tc) - length(bc);
+    float3 n = normalize(float3(dx, dy, length(texel)));
+    float diffuse = clamp(n.z + 0.7, 0.7, 1.0);
+    base *= diffuse;
+
+    float3 bloom = max(compositeBloomTex.SampleLevel(LinearClamp, i.uv, 0).rgb, 0.0);
+    bloom = max(1.055 * pow(bloom, 1.0 / 2.4) - 0.055, 0.0);
+    base += bloom;
+
+    return float4(base, 1.0);
+}
+)HLSL";
+
+class FluidSimulation {
+public:
+  enum class TickResult { Ok, Skipped, DeviceLost };
+
+  bool Initialize(ID3D11Device *device, ID3D11DeviceContext *context,
+                  IDXGISwapChain1 *swapChain, HWND hwnd, int screenW, int screenH);
+  void Resize(int screenW, int screenH);
+  void Shutdown();
+  bool IsInitialized() const { return m_initialized; }
+
+  TickResult Tick(bool isOnBattery);
+
+  void SetPausedForFullscreen(bool paused) { m_pausedForFullscreen = paused; }
+  void SetPausedForBattery(bool paused) { m_pausedForBattery = paused; }
+  void SetPausedForSession(bool paused) { m_pausedForSession = paused; }
+
+private:
+  bool CreateResources();
+  bool CreateBloomChain();
+  void ReleaseSimTextures();
+  void ReleaseBloomTextures();
+  bool CompileShaders();
+  void ComputeResolutions(int screenW, int screenH);
+  void ClearAllTextures();
+  void UpdateSimulation(float dt);
+  void DoSplatVelocity(float x, float y, float dx, float dy, float radiusUV);
+  void DoSplatDye(float x, float y, float r, float g, float b, float radiusUV);
+  void ComputeSplatColor(float &r, float &g, float &b);
+  void ApplyBloom();
+  void RenderComposite(ID3D11RenderTargetView *rtv);
+  void DispatchSim(int w, int h) { m_context->Dispatch((w + 7) / 8, (h + 7) / 8, 1); }
+  bool IsEffectivePaused() const {
+    return m_pausedForFullscreen || m_pausedForBattery || m_pausedForSession;
+  }
+
+  static const int kBloomIterations = 8;
+
+  bool m_initialized = false;
+  ID3D11Device *m_device = nullptr;
+  ID3D11DeviceContext *m_context = nullptr;
+  IDXGISwapChain1 *m_swapChain = nullptr;
+  HWND m_hwnd = nullptr;
+
+  int m_simWidth = 0;
+  int m_simHeight = 0;
+  int m_dyeWidth = 0;
+  int m_dyeHeight = 0;
+  int m_bloomWidth = 0;
+  int m_bloomHeight = 0;
+  int m_bloomChainCount = 0;
+  int m_screenWidth = 0;
+  int m_screenHeight = 0;
+  RECT m_windowRect = {};
+
+  SimTexture m_velocity[2];
+  int m_velocityIdx = 0;
+  SimTexture m_dye[2];
+  int m_dyeIdx = 0;
+  SimTexture m_pressure[2];
+  int m_pressureIdx = 0;
+  SimTexture m_divergence;
+  SimTexture m_curl;
+
+  SimTexture m_bloom;
+  SimTexture m_bloomChain[kBloomIterations];
+
+  ComPtr<ID3D11ComputeShader> m_csSplat;
+  ComPtr<ID3D11ComputeShader> m_csAdvect;
+  ComPtr<ID3D11ComputeShader> m_csDivergence;
+  ComPtr<ID3D11ComputeShader> m_csPressureJacobi;
+  ComPtr<ID3D11ComputeShader> m_csGradientSubtract;
+  ComPtr<ID3D11ComputeShader> m_csCurl;
+  ComPtr<ID3D11ComputeShader> m_csVorticity;
+  ComPtr<ID3D11ComputeShader> m_csClear;
+  ComPtr<ID3D11ComputeShader> m_csBloomPrefilter;
+  ComPtr<ID3D11ComputeShader> m_csBloomBlur;
+  ComPtr<ID3D11ComputeShader> m_csBloomUpsample;
+  ComPtr<ID3D11ComputeShader> m_csBloomFinal;
+  ComPtr<ID3D11VertexShader> m_vsFullscreen;
+  ComPtr<ID3D11PixelShader> m_psComposite;
+
+  ComPtr<ID3D11Buffer> m_cbSimParams;
+  ComPtr<ID3D11Buffer> m_cbSplatParams;
+  ComPtr<ID3D11Buffer> m_cbVorticityParams;
+  ComPtr<ID3D11Buffer> m_cbBloomParams;
+  ComPtr<ID3D11SamplerState> m_sampler;
+  ComPtr<ID3D11RasterizerState> m_rasterizerState;
+
+  ComPtr<ID3D11Texture2D> m_cachedBackBuffer[2];
+  ComPtr<ID3D11RenderTargetView> m_cachedBackBufferRtv[2];
+
+  bool m_havePrevCursor = false;
+  POINT m_prevCursor = {};
+  float m_cursorColorR = 0.0f;
+  float m_cursorColorG = 0.0f;
+  float m_cursorColorB = 0.0f;
+  float m_cursorColorTimer = 0.0f;
+  bool m_cursorColorValid = false;
+  DWORD m_lastCornerSplatTickMs = 0;
+  DWORD m_lastPressureResetTickMs = 0;
+  LARGE_INTEGER m_lastFrameTicks = {};
+  UINT64 m_frameNumber = 0;
+
+  bool m_pausedForFullscreen = false;
+  bool m_pausedForBattery = false;
+  bool m_pausedForSession = false;
+  bool m_everShown = false;
+  DWORD m_lastDropFpsTickMs = 0;
+  bool m_wasPausedLastTick = false;
+  bool m_pendingReturnSplats = false;
+};
+
+void FluidSimulation::ComputeResolutions(int screenW, int screenH) {
+  auto computeLongEdge = [](int sw, int sh, int maxDim, int &outW, int &outH) {
+    if (sw <= 0 || sh <= 0) { outW = maxDim; outH = maxDim; return; }
+    if (sw >= sh) {
+      outW = maxDim;
+      outH = (std::max)(16, (int)((int64_t)maxDim * sh / sw));
+    } else {
+      outH = maxDim;
+      outW = (std::max)(16, (int)((int64_t)maxDim * sw / sh));
+    }
+  };
+  computeLongEdge(screenW, screenH, 128, m_simWidth, m_simHeight);
+  computeLongEdge(screenW, screenH, 1024, m_dyeWidth, m_dyeHeight);
+  computeLongEdge(screenW, screenH, 256, m_bloomWidth, m_bloomHeight);
+}
+
+bool FluidSimulation::CreateResources() {
+  ReleaseSimTextures();
+  bool ok = true;
+  for (int i = 0; i < 2 && ok; ++i) {
+    ok = ok && CreateSimTexture(m_device, m_simWidth, m_simHeight, m_velocity[i]);
+    ok = ok && CreateSimTexture(m_device, m_simWidth, m_simHeight, m_pressure[i]);
+  }
+  for (int i = 0; i < 2 && ok; ++i) {
+    ok = ok && CreateSimTexture(m_device, m_dyeWidth, m_dyeHeight, m_dye[i]);
+  }
+  ok = ok && CreateSimTexture(m_device, m_simWidth, m_simHeight, m_divergence);
+  ok = ok && CreateSimTexture(m_device, m_simWidth, m_simHeight, m_curl);
+  m_velocityIdx = 0;
+  m_dyeIdx = 0;
+  m_pressureIdx = 0;
+  return ok;
+}
+
+bool FluidSimulation::CreateBloomChain() {
+  ReleaseBloomTextures();
+  if (!CreateSimTexture(m_device, m_bloomWidth, m_bloomHeight, m_bloom))
+    return false;
+  m_bloomChainCount = 0;
+  for (int i = 0; i < kBloomIterations; ++i) {
+    int w = m_bloomWidth >> (i + 1);
+    int h = m_bloomHeight >> (i + 1);
+    if (w < 2 || h < 2) break;
+    if (!CreateSimTexture(m_device, w, h, m_bloomChain[i]))
+      return false;
+    m_bloomChainCount++;
+  }
+  return true;
+}
+
+void FluidSimulation::ReleaseSimTextures() {
+  for (int i = 0; i < 2; ++i) {
+    m_velocity[i].Reset();
+    m_dye[i].Reset();
+    m_pressure[i].Reset();
+  }
+  m_divergence.Reset();
+  m_curl.Reset();
+}
+
+void FluidSimulation::ReleaseBloomTextures() {
+  m_bloom.Reset();
+  for (int i = 0; i < kBloomIterations; ++i)
+    m_bloomChain[i].Reset();
+  m_bloomChainCount = 0;
+}
+
+void FluidSimulation::ClearAllTextures() {
+  const FLOAT zero[4] = {0, 0, 0, 0};
+  for (int i = 0; i < 2; ++i) {
+    m_context->ClearUnorderedAccessViewFloat(m_velocity[i].uav.Get(), zero);
+    m_context->ClearUnorderedAccessViewFloat(m_dye[i].uav.Get(), zero);
+    m_context->ClearUnorderedAccessViewFloat(m_pressure[i].uav.Get(), zero);
+  }
+  m_context->ClearUnorderedAccessViewFloat(m_divergence.uav.Get(), zero);
+  m_context->ClearUnorderedAccessViewFloat(m_curl.uav.Get(), zero);
+}
+
+bool FluidSimulation::CompileShaders() {
+  size_t srcLen = strlen(kFluidShaderSource);
+
+  auto compileCS = [&](const char *entry, ComPtr<ID3D11ComputeShader> &out) -> bool {
+    ComPtr<ID3DBlob> blob = FluidCompileShaderBlob(kFluidShaderSource, srcLen, entry, "cs_5_0");
+    if (!blob.Get()) return false;
+    if (blob->GetBufferSize() == 0) {
+      Wh_Log(L"FluidSimulation: compiler returned empty bytecode for %hs", entry);
+      return false;
+    }
+    HRESULT hr = m_device->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(),
+                                               nullptr, &out);
+    if (FAILED(hr)) {
+      Wh_Log(L"FluidSimulation: CreateComputeShader(%hs) failed, hr=0x%08lX", entry,
+             (unsigned long)hr);
+      return false;
+    }
+    return true;
+  };
+
+  if (!compileCS("SplatCS", m_csSplat)) return false;
+  if (!compileCS("AdvectCS", m_csAdvect)) return false;
+  if (!compileCS("DivergenceCS", m_csDivergence)) return false;
+  if (!compileCS("PressureJacobiCS", m_csPressureJacobi)) return false;
+  if (!compileCS("GradientSubtractCS", m_csGradientSubtract)) return false;
+  if (!compileCS("CurlCS", m_csCurl)) return false;
+  if (!compileCS("VorticityCS", m_csVorticity)) return false;
+  if (!compileCS("ClearCS", m_csClear)) return false;
+  if (!compileCS("BloomPrefilterCS", m_csBloomPrefilter)) return false;
+  if (!compileCS("BloomBlurCS", m_csBloomBlur)) return false;
+  if (!compileCS("BloomUpsampleCS", m_csBloomUpsample)) return false;
+  if (!compileCS("BloomFinalCS", m_csBloomFinal)) return false;
+
+  ComPtr<ID3DBlob> vsBlob = FluidCompileShaderBlob(kFluidShaderSource, srcLen, "FullscreenVS", "vs_5_0");
+  if (!vsBlob.Get()) return false;
+  HRESULT hr = m_device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+                                            nullptr, &m_vsFullscreen);
+  if (FAILED(hr)) {
+    Wh_Log(L"FluidSimulation: CreateVertexShader failed, hr=0x%08lX", (unsigned long)hr);
+    return false;
+  }
+
+  ComPtr<ID3DBlob> psBlob = FluidCompileShaderBlob(kFluidShaderSource, srcLen, "CompositePS", "ps_5_0");
+  if (!psBlob.Get()) return false;
+  hr = m_device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr,
+                                   &m_psComposite);
+  if (FAILED(hr)) {
+    Wh_Log(L"FluidSimulation: CreatePixelShader failed, hr=0x%08lX", (unsigned long)hr);
+    return false;
+  }
+  return true;
+}
+
+bool FluidSimulation::Initialize(ID3D11Device *device, ID3D11DeviceContext *context,
+                                 IDXGISwapChain1 *swapChain, HWND hwnd, int screenW, int screenH) {
+  Shutdown();
+  if (!device || !context || !swapChain || !hwnd)
+    return false;
+
+  if (device->GetFeatureLevel() < D3D_FEATURE_LEVEL_11_0) {
+    Wh_Log(L"FluidSimulation::Initialize: GPU feature level below 11_0; aborting fluid mode");
+    return false;
+  }
+
+  m_device = device;
+  m_context = context;
+  m_swapChain = swapChain;
+  m_hwnd = hwnd;
+  m_screenWidth = screenW;
+  m_screenHeight = screenH;
+  GetWindowRect(hwnd, &m_windowRect);
+
+  // Multithread protection is required when Media Foundation shares the
+  // D3D11 device across its own decoder worker threads (video mode). With
+  // MF not running in fluid mode, only the wallpaper thread touches the
+  // device, so turning the lock off is safe and gives back the frame
+  // budget. Re-enabled automatically by VideoPlayer::InitD3DAndSwapChain
+  // on the next switch back to video mode.
+  {
+    ComPtr<ID3D10Multithread> mt;
+    if (SUCCEEDED(device->QueryInterface(__uuidof(ID3D10Multithread),
+                                         (void **)&mt))) {
+      mt->SetMultithreadProtected(FALSE);
+    }
+  }
+
+  if (!CompileShaders()) {
+    Wh_Log(L"FluidSimulation::Initialize: shader compilation failed");
+    Shutdown();
+    return false;
+  }
+
+  ComputeResolutions(screenW, screenH);
+  if (!CreateResources() || !CreateBloomChain()) {
+    Wh_Log(L"FluidSimulation::Initialize: resource creation failed");
+    Shutdown();
+    return false;
+  }
+
+  D3D11_SAMPLER_DESC sampDesc = {};
+  sampDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+  sampDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampDesc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampDesc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sampDesc.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  sampDesc.MaxLOD = D3D11_FLOAT32_MAX;
+  HRESULT hr = device->CreateSamplerState(&sampDesc, &m_sampler);
+  if (FAILED(hr)) { Shutdown(); return false; }
+
+  D3D11_RASTERIZER_DESC rastDesc = {};
+  rastDesc.FillMode = D3D11_FILL_SOLID;
+  rastDesc.CullMode = D3D11_CULL_NONE;
+  rastDesc.DepthClipEnable = TRUE;
+  hr = device->CreateRasterizerState(&rastDesc, &m_rasterizerState);
+  if (FAILED(hr)) { Shutdown(); return false; }
+
+  D3D11_BUFFER_DESC cbDesc = {};
+  cbDesc.Usage = D3D11_USAGE_DEFAULT;
+  cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+
+  cbDesc.ByteWidth = sizeof(FluidSimParamsCB);
+  if (FAILED(device->CreateBuffer(&cbDesc, nullptr, &m_cbSimParams))) { Shutdown(); return false; }
+  cbDesc.ByteWidth = sizeof(FluidSplatParamsCB);
+  if (FAILED(device->CreateBuffer(&cbDesc, nullptr, &m_cbSplatParams))) { Shutdown(); return false; }
+  cbDesc.ByteWidth = sizeof(FluidVorticityParamsCB);
+  if (FAILED(device->CreateBuffer(&cbDesc, nullptr, &m_cbVorticityParams))) { Shutdown(); return false; }
+  cbDesc.ByteWidth = sizeof(FluidBloomParamsCB);
+  if (FAILED(device->CreateBuffer(&cbDesc, nullptr, &m_cbBloomParams))) { Shutdown(); return false; }
+
+  ClearAllTextures();
+
+  QueryPerformanceCounter(&m_lastFrameTicks);
+  m_havePrevCursor = false;
+  m_lastCornerSplatTickMs = 0;
+  m_lastPressureResetTickMs = 0;
+  m_frameNumber = 0;
+  m_everShown = false;
+  m_initialized = true;
+
+  // Seed with random splats so the wallpaper starts alive.
+  int seed = 5 + (rand() % 20);
+  for (int i = 0; i < seed; ++i) {
+    float r, g, b;
+    ComputeSplatColor(r, g, b);
+    float x = (float)rand() / (float)RAND_MAX;
+    float y = (float)rand() / (float)RAND_MAX;
+    float dx = 1000.0f * ((float)rand() / (float)RAND_MAX - 0.5f);
+    float dy = 1000.0f * ((float)rand() / (float)RAND_MAX - 0.5f);
+    float radiusUV = 0.0025f;
+    if (m_screenWidth > m_screenHeight) radiusUV *= (float)m_screenWidth / (float)m_screenHeight;
+    DoSplatVelocity(x, y, dx, dy, radiusUV);
+    DoSplatDye(x, y, r * 10.0f, g * 10.0f, b * 10.0f, radiusUV);
+  }
+
+  Wh_Log(L"FluidSimulation::Initialize: ready (sim %dx%d, dye %dx%d, bloom %dx%d)",
+         m_simWidth, m_simHeight, m_dyeWidth, m_dyeHeight, m_bloomWidth, m_bloomHeight);
+  return true;
+}
+
+void FluidSimulation::Resize(int screenW, int screenH) {
+  if (!m_initialized)
+    return;
+  m_screenWidth = screenW;
+  m_screenHeight = screenH;
+  if (m_hwnd)
+    GetWindowRect(m_hwnd, &m_windowRect);
+
+  for (int i = 0; i < 2; ++i) {
+    m_cachedBackBuffer[i].Reset();
+    m_cachedBackBufferRtv[i].Reset();
+  }
+
+  int oldSimW = m_simWidth, oldSimH = m_simHeight;
+  int oldDyeW = m_dyeWidth, oldDyeH = m_dyeHeight;
+  ComputeResolutions(screenW, screenH);
+  if (m_simWidth != oldSimW || m_simHeight != oldSimH ||
+      m_dyeWidth != oldDyeW || m_dyeHeight != oldDyeH) {
+    if (CreateResources() && CreateBloomChain())
+      ClearAllTextures();
+  }
+}
+
+void FluidSimulation::Shutdown() {
+  ReleaseSimTextures();
+  ReleaseBloomTextures();
+  m_csSplat.Reset();
+  m_csAdvect.Reset();
+  m_csDivergence.Reset();
+  m_csPressureJacobi.Reset();
+  m_csGradientSubtract.Reset();
+  m_csCurl.Reset();
+  m_csVorticity.Reset();
+  m_csClear.Reset();
+  m_csBloomPrefilter.Reset();
+  m_csBloomBlur.Reset();
+  m_csBloomUpsample.Reset();
+  m_csBloomFinal.Reset();
+  m_vsFullscreen.Reset();
+  m_psComposite.Reset();
+  m_cbSimParams.Reset();
+  m_cbSplatParams.Reset();
+  m_cbVorticityParams.Reset();
+  m_cbBloomParams.Reset();
+  m_sampler.Reset();
+  m_rasterizerState.Reset();
+  for (int i = 0; i < 2; ++i) {
+    m_cachedBackBuffer[i].Reset();
+    m_cachedBackBufferRtv[i].Reset();
+  }
+  m_device = nullptr;
+  m_context = nullptr;
+  m_swapChain = nullptr;
+  m_hwnd = nullptr;
+  m_havePrevCursor = false;
+  m_pausedForFullscreen = m_pausedForBattery = m_pausedForSession = false;
+  m_everShown = false;
+  m_initialized = false;
+}
+
+void FluidSimulation::ComputeSplatColor(float &r, float &g, float &b) {
+  if (g_fluidColorful.load()) {
+    float hue = (float)rand() / (float)RAND_MAX;
+    FluidHsvToRgb(hue, 1.0f, 1.0f, r, g, b);
+  } else {
+    r = 0.2f; g = 0.8f; b = 1.0f;
+  }
+  r *= 0.15f; g *= 0.15f; b *= 0.15f;
+}
+
+void FluidSimulation::DoSplatVelocity(float x, float y, float dx, float dy, float radiusUV) {
+  FluidSplatParamsCB sp = {};
+  sp.pointX = x;
+  sp.pointY = y;
+  sp.value0 = dx;
+  sp.value1 = dy;
+  sp.radiusSq = radiusUV;
+  sp.aspectRatio = (m_screenHeight > 0)
+                       ? (float)m_screenWidth / (float)m_screenHeight : 1.0f;
+  m_context->UpdateSubresource(m_cbSplatParams.Get(), 0, nullptr, &sp, 0, 0);
+  ID3D11Buffer *cb = m_cbSplatParams.Get();
+  m_context->CSSetConstantBuffers(1, 1, &cb);
+
+  int dst = 1 - m_velocityIdx;
+  ID3D11ShaderResourceView *srv = m_velocity[m_velocityIdx].srv.Get();
+  m_context->CSSetShaderResources(0, 1, &srv);
+  ID3D11UnorderedAccessView *uav = m_velocity[dst].uav.Get();
+  m_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+  m_context->CSSetShader(m_csSplat.Get(), nullptr, 0);
+  DispatchSim(m_simWidth, m_simHeight);
+  FluidUnbindCSUAVs(m_context, 0, 1);
+  FluidUnbindCSSRVs(m_context, 0, 1);
+  m_velocityIdx = dst;
+}
+
+void FluidSimulation::DoSplatDye(float x, float y, float r, float g, float b, float radiusUV) {
+  FluidSplatParamsCB sp = {};
+  sp.pointX = x;
+  sp.pointY = y;
+  sp.value0 = r;
+  sp.value1 = g;
+  sp.value2 = b;
+  sp.radiusSq = radiusUV;
+  sp.aspectRatio = (m_screenHeight > 0)
+                       ? (float)m_screenWidth / (float)m_screenHeight : 1.0f;
+  m_context->UpdateSubresource(m_cbSplatParams.Get(), 0, nullptr, &sp, 0, 0);
+  ID3D11Buffer *cb = m_cbSplatParams.Get();
+  m_context->CSSetConstantBuffers(1, 1, &cb);
+
+  int dst = 1 - m_dyeIdx;
+  ID3D11ShaderResourceView *srv = m_dye[m_dyeIdx].srv.Get();
+  m_context->CSSetShaderResources(0, 1, &srv);
+  ID3D11UnorderedAccessView *uav = m_dye[dst].uav.Get();
+  m_context->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
+  m_context->CSSetShader(m_csSplat.Get(), nullptr, 0);
+  DispatchSim(m_dyeWidth, m_dyeHeight);
+  FluidUnbindCSUAVs(m_context, 0, 1);
+  FluidUnbindCSSRVs(m_context, 0, 1);
+  m_dyeIdx = dst;
+}
+
+void FluidSimulation::UpdateSimulation(float dt) {
+  int radiusPct = g_fluidSplatRadius.load();
+  int speedPct  = g_fluidSpeed.load();
+  int randomIntervalSec = g_fluidRandomSplatsInterval.load();
+
+  float radiusScale = (radiusPct <= 0) ? 0.05f : (radiusPct / 25.0f);
+  float speedMul    = speedPct / 100.0f;
+  if (speedMul < 0.05f) speedMul = 0.05f;
+
+  float dyeDissipation = 1.0f;
+  float vorticityStrength = 30.0f * speedMul;
+  float velDissipation   = 0.2f / speedMul;
+  float splatForce       = 6000.0f * speedMul;
+
+  bool cornerSplatsEnabled = (randomIntervalSec > 0);
+  const float kSplatRadiusUVBase = 0.0025f * radiusScale;
+
+  // Welcome-back burst: fired once per pause->unpause cycle. Slightly
+  // larger and force-driven than the periodic ambient splats so the
+  // display clearly reacts to being visible again. Also resets the
+  // interval timer so we don't double-burst back-to-back.
+  if (m_pendingReturnSplats) {
+    m_pendingReturnSplats = false;
+    int count = 10 + (rand() % 6);
+    for (int i = 0; i < count; ++i) {
+      float r, g, b;
+      ComputeSplatColor(r, g, b);
+
+      float px = (float)rand() / (float)RAND_MAX;
+      float py = (float)rand() / (float)RAND_MAX;
+      float dx = 1500.0f * ((float)rand() / (float)RAND_MAX - 0.5f);
+      float dy = 1500.0f * ((float)rand() / (float)RAND_MAX - 0.5f);
+
+      float radiusUV = kSplatRadiusUVBase;
+      if (m_screenWidth > m_screenHeight)
+        radiusUV *= (float)m_screenWidth / (float)m_screenHeight;
+
+      DoSplatVelocity(px, py, dx, dy, radiusUV);
+      DoSplatDye(px, py, r * 10.0f, g * 10.0f, b * 10.0f, radiusUV);
+    }
+    m_lastCornerSplatTickMs = GetTickCount();
+  }
+
+  if (!g_fluidColorful.load()) {
+    m_cursorColorR = 0.2f; m_cursorColorG = 0.8f; m_cursorColorB = 1.0f;
+    m_cursorColorValid = true;
+  } else {
+    m_cursorColorTimer += dt * 2.0f;
+    if (!m_cursorColorValid || m_cursorColorTimer >= 1.0f) {
+      m_cursorColorTimer = 0.0f;
+      float hue = (float)rand() / (float)RAND_MAX;
+      FluidHsvToRgb(hue, 1.0f, 1.0f, m_cursorColorR, m_cursorColorG, m_cursorColorB);
+      m_cursorColorValid = true;
+    }
+  }
+
+  POINT cursor;
+  if (GetCursorPos(&cursor)) {
+    int ww = m_windowRect.right - m_windowRect.left;
+    int wh = m_windowRect.bottom - m_windowRect.top;
+    if (ww > 0 && wh > 0) {
+      float ux = (float)(cursor.x - m_windowRect.left) / (float)ww;
+      float uy = (float)(cursor.y - m_windowRect.top) / (float)wh;
+      bool inBounds = (ux >= 0.0f && ux <= 1.0f && uy >= 0.0f && uy <= 1.0f);
+
+      if (inBounds && m_havePrevCursor) {
+        float prevUx = (float)(m_prevCursor.x - m_windowRect.left) / (float)ww;
+        float prevUy = (float)(m_prevCursor.y - m_windowRect.top) / (float)wh;
+        float dUx = ux - prevUx;
+        float dUy = uy - prevUy;
+        if (fabsf(dUx) > 1e-5f || fabsf(dUy) > 1e-5f) {
+          float dx = dUx * splatForce;
+          float dy = dUy * splatForce;
+
+          float r = m_cursorColorR * 0.15f;
+          float g = m_cursorColorG * 0.15f;
+          float b = m_cursorColorB * 0.15f;
+
+          float radiusUV = kSplatRadiusUVBase;
+          if (m_screenWidth > m_screenHeight)
+            radiusUV *= (float)m_screenWidth / (float)m_screenHeight;
+
+          DoSplatVelocity(ux, uy, dx, dy, radiusUV);
+          DoSplatDye(ux, uy, r, g, b, radiusUV);
+        }
+      }
+      m_havePrevCursor = inBounds;
+      if (inBounds)
+        m_prevCursor = cursor;
+    }
+  }
+
+  DWORD nowMs = GetTickCount();
+  if (cornerSplatsEnabled && nowMs - m_lastCornerSplatTickMs > (DWORD)(randomIntervalSec * 1000)) {
+    int count = 5 + (rand() % 6);
+    for (int i = 0; i < count; ++i) {
+      float r, g, b;
+      ComputeSplatColor(r, g, b);
+
+      float px = (float)rand() / (float)RAND_MAX;
+      float py = (float)rand() / (float)RAND_MAX;
+      float dx = 1000.0f * ((float)rand() / (float)RAND_MAX - 0.5f);
+      float dy = 1000.0f * ((float)rand() / (float)RAND_MAX - 0.5f);
+
+      float radiusUV = kSplatRadiusUVBase;
+      if (m_screenWidth > m_screenHeight)
+        radiusUV *= (float)m_screenWidth / (float)m_screenHeight;
+
+      DoSplatVelocity(px, py, dx, dy, radiusUV);
+      DoSplatDye(px, py, r * 10.0f, g * 10.0f, b * 10.0f, radiusUV);
+    }
+    m_lastCornerSplatTickMs = nowMs;
+  }
+
+  FluidSimParamsCB sp = {};
+  sp.dt = dt;
+  sp.simTexelX = 1.0f / (float)m_simWidth;
+  sp.simTexelY = 1.0f / (float)m_simHeight;
+
+  {
+    ID3D11ShaderResourceView *srv = m_velocity[m_velocityIdx].srv.Get();
+    m_context->CSSetShaderResources(8, 1, &srv);
+    ID3D11UnorderedAccessView *uav = m_curl.uav.Get();
+    m_context->CSSetUnorderedAccessViews(5, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csCurl.Get(), nullptr, 0);
+    DispatchSim(m_simWidth, m_simHeight);
+    FluidUnbindCSUAVs(m_context, 5, 1);
+    FluidUnbindCSSRVs(m_context, 8, 1);
+  }
+
+  {
+    FluidVorticityParamsCB vp = {};
+    vp.curl = vorticityStrength;
+    vp.dt = dt;
+    m_context->UpdateSubresource(m_cbVorticityParams.Get(), 0, nullptr, &vp, 0, 0);
+    ID3D11Buffer *cb = m_cbVorticityParams.Get();
+    m_context->CSSetConstantBuffers(2, 1, &cb);
+
+    int dst = 1 - m_velocityIdx;
+    ID3D11ShaderResourceView *srvs[2] = {m_velocity[m_velocityIdx].srv.Get(), m_curl.srv.Get()};
+    m_context->CSSetShaderResources(9, 2, srvs);
+    ID3D11UnorderedAccessView *uav = m_velocity[dst].uav.Get();
+    m_context->CSSetUnorderedAccessViews(6, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csVorticity.Get(), nullptr, 0);
+    DispatchSim(m_simWidth, m_simHeight);
+    FluidUnbindCSUAVs(m_context, 6, 1);
+    FluidUnbindCSSRVs(m_context, 9, 2);
+    m_velocityIdx = dst;
+  }
+
+  {
+    ID3D11ShaderResourceView *srv = m_velocity[m_velocityIdx].srv.Get();
+    m_context->CSSetShaderResources(3, 1, &srv);
+    ID3D11UnorderedAccessView *uav = m_divergence.uav.Get();
+    m_context->CSSetUnorderedAccessViews(2, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csDivergence.Get(), nullptr, 0);
+    DispatchSim(m_simWidth, m_simHeight);
+    FluidUnbindCSUAVs(m_context, 2, 1);
+    FluidUnbindCSSRVs(m_context, 3, 1);
+  }
+
+  {
+    FluidSimParamsCB cp = sp;
+    cp.clearValue = 0.5f;
+    m_context->UpdateSubresource(m_cbSimParams.Get(), 0, nullptr, &cp, 0, 0);
+    ID3D11Buffer *cb = m_cbSimParams.Get();
+    m_context->CSSetConstantBuffers(0, 1, &cb);
+
+    int dst = 1 - m_pressureIdx;
+    ID3D11ShaderResourceView *srv = m_pressure[m_pressureIdx].srv.Get();
+    m_context->CSSetShaderResources(12, 1, &srv);
+    ID3D11UnorderedAccessView *uav = m_pressure[dst].uav.Get();
+    m_context->CSSetUnorderedAccessViews(7, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csClear.Get(), nullptr, 0);
+    DispatchSim(m_simWidth, m_simHeight);
+    FluidUnbindCSUAVs(m_context, 7, 1);
+    FluidUnbindCSSRVs(m_context, 12, 1);
+    m_pressureIdx = dst;
+  }
+
+  const int kPressureIterations = 12;
+  for (int iter = 0; iter < kPressureIterations; ++iter) {
+    int dst = 1 - m_pressureIdx;
+    ID3D11ShaderResourceView *srvs[2] = {m_pressure[m_pressureIdx].srv.Get(),
+                                         m_divergence.srv.Get()};
+    m_context->CSSetShaderResources(4, 2, srvs);
+    ID3D11UnorderedAccessView *uav = m_pressure[dst].uav.Get();
+    m_context->CSSetUnorderedAccessViews(3, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csPressureJacobi.Get(), nullptr, 0);
+    DispatchSim(m_simWidth, m_simHeight);
+    FluidUnbindCSUAVs(m_context, 3, 1);
+    FluidUnbindCSSRVs(m_context, 4, 2);
+    m_pressureIdx = dst;
+  }
+
+  {
+    int dst = 1 - m_velocityIdx;
+    ID3D11ShaderResourceView *srvs[2] = {m_velocity[m_velocityIdx].srv.Get(),
+                                         m_pressure[m_pressureIdx].srv.Get()};
+    m_context->CSSetShaderResources(6, 2, srvs);
+    ID3D11UnorderedAccessView *uav = m_velocity[dst].uav.Get();
+    m_context->CSSetUnorderedAccessViews(4, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csGradientSubtract.Get(), nullptr, 0);
+    DispatchSim(m_simWidth, m_simHeight);
+    FluidUnbindCSUAVs(m_context, 4, 1);
+    FluidUnbindCSSRVs(m_context, 6, 2);
+    m_velocityIdx = dst;
+  }
+
+  {
+    sp.dissipation = velDissipation;
+    m_context->UpdateSubresource(m_cbSimParams.Get(), 0, nullptr, &sp, 0, 0);
+    ID3D11Buffer *cb = m_cbSimParams.Get();
+    m_context->CSSetConstantBuffers(0, 1, &cb);
+    ID3D11SamplerState *samp = m_sampler.Get();
+    m_context->CSSetSamplers(0, 1, &samp);
+
+    int dst = 1 - m_velocityIdx;
+    ID3D11ShaderResourceView *srvs[2] = {m_velocity[m_velocityIdx].srv.Get(),
+                                         m_velocity[m_velocityIdx].srv.Get()};
+    m_context->CSSetShaderResources(1, 2, srvs);
+    ID3D11UnorderedAccessView *uav = m_velocity[dst].uav.Get();
+    m_context->CSSetUnorderedAccessViews(1, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csAdvect.Get(), nullptr, 0);
+    DispatchSim(m_simWidth, m_simHeight);
+    FluidUnbindCSUAVs(m_context, 1, 1);
+    FluidUnbindCSSRVs(m_context, 1, 2);
+    m_velocityIdx = dst;
+  }
+
+  {
+    sp.dissipation = dyeDissipation;
+    m_context->UpdateSubresource(m_cbSimParams.Get(), 0, nullptr, &sp, 0, 0);
+    ID3D11Buffer *cb = m_cbSimParams.Get();
+    m_context->CSSetConstantBuffers(0, 1, &cb);
+
+    int dst = 1 - m_dyeIdx;
+    ID3D11ShaderResourceView *srvs[2] = {m_velocity[m_velocityIdx].srv.Get(),
+                                         m_dye[m_dyeIdx].srv.Get()};
+    m_context->CSSetShaderResources(1, 2, srvs);
+    ID3D11UnorderedAccessView *uav = m_dye[dst].uav.Get();
+    m_context->CSSetUnorderedAccessViews(1, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csAdvect.Get(), nullptr, 0);
+    DispatchSim(m_dyeWidth, m_dyeHeight);
+    FluidUnbindCSUAVs(m_context, 1, 1);
+    FluidUnbindCSSRVs(m_context, 1, 2);
+    m_dyeIdx = dst;
+  }
+
+  m_context->CSSetShader(nullptr, nullptr, 0);
+}
+
+void FluidSimulation::ApplyBloom() {
+  if (m_bloomChainCount < 2)
+    return;
+
+  const float kThreshold = 0.6f;
+  const float kSoftKnee   = 0.7f;
+  const float kIntensity  = g_fluidBloom.load() / 100.0f;
+
+  float knee   = kThreshold * kSoftKnee + 0.0001f;
+  float curve0 = kThreshold - knee;
+  float curve1 = knee * 2.0f;
+  float curve2 = 0.25f / knee;
+
+  {
+    FluidBloomParamsCB bp = {};
+    bp.intensity = kIntensity;
+    bp.threshold = kThreshold;
+    bp.curve0 = curve0;
+    bp.curve1 = curve1;
+    bp.curve2 = curve2;
+    m_context->UpdateSubresource(m_cbBloomParams.Get(), 0, nullptr, &bp, 0, 0);
+    ID3D11Buffer *cb = m_cbBloomParams.Get();
+    m_context->CSSetConstantBuffers(3, 1, &cb);
+
+    ID3D11ShaderResourceView *srv = m_dye[m_dyeIdx].srv.Get();
+    m_context->CSSetShaderResources(11, 1, &srv);
+    ID3D11UnorderedAccessView *uav = m_bloom.uav.Get();
+    m_context->CSSetUnorderedAccessViews(7, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csBloomPrefilter.Get(), nullptr, 0);
+    DispatchSim(m_bloomWidth, m_bloomHeight);
+    FluidUnbindCSUAVs(m_context, 7, 1);
+    FluidUnbindCSSRVs(m_context, 11, 1);
+  }
+
+  SimTexture *last = &m_bloom;
+  for (int i = 0; i < m_bloomChainCount; ++i) {
+    SimTexture *dst = &m_bloomChain[i];
+    D3D11_TEXTURE2D_DESC srcDesc;
+    last->tex->GetDesc(&srcDesc);
+
+    FluidBloomParamsCB bp = {};
+    bp.texelSizeX = 1.0f / (float)srcDesc.Width;
+    bp.texelSizeY = 1.0f / (float)srcDesc.Height;
+    m_context->UpdateSubresource(m_cbBloomParams.Get(), 0, nullptr, &bp, 0, 0);
+    ID3D11Buffer *cb = m_cbBloomParams.Get();
+    m_context->CSSetConstantBuffers(3, 1, &cb);
+
+    ID3D11ShaderResourceView *srv = last->srv.Get();
+    m_context->CSSetShaderResources(11, 1, &srv);
+    ID3D11UnorderedAccessView *uav = dst->uav.Get();
+    m_context->CSSetUnorderedAccessViews(7, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csBloomBlur.Get(), nullptr, 0);
+    DispatchSim((int)srcDesc.Width / 2, (int)srcDesc.Height / 2);
+    FluidUnbindCSUAVs(m_context, 7, 1);
+    FluidUnbindCSSRVs(m_context, 11, 1);
+    last = dst;
+  }
+
+  for (int i = m_bloomChainCount - 2; i >= 0; --i) {
+    SimTexture *src = &m_bloomChain[i + 1];
+    SimTexture *dst = &m_bloomChain[i];
+    D3D11_TEXTURE2D_DESC srcDesc;
+    src->tex->GetDesc(&srcDesc);
+
+    FluidBloomParamsCB bp = {};
+    bp.texelSizeX = 1.0f / (float)srcDesc.Width;
+    bp.texelSizeY = 1.0f / (float)srcDesc.Height;
+    m_context->UpdateSubresource(m_cbBloomParams.Get(), 0, nullptr, &bp, 0, 0);
+    ID3D11Buffer *cb = m_cbBloomParams.Get();
+    m_context->CSSetConstantBuffers(3, 1, &cb);
+
+    ID3D11ShaderResourceView *srv = src->srv.Get();
+    m_context->CSSetShaderResources(11, 1, &srv);
+    ID3D11UnorderedAccessView *uav = dst->uav.Get();
+    m_context->CSSetUnorderedAccessViews(7, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csBloomUpsample.Get(), nullptr, 0);
+
+    D3D11_TEXTURE2D_DESC dstDesc;
+    dst->tex->GetDesc(&dstDesc);
+    DispatchSim((int)dstDesc.Width, (int)dstDesc.Height);
+    FluidUnbindCSUAVs(m_context, 7, 1);
+    FluidUnbindCSSRVs(m_context, 11, 1);
+  }
+
+  {
+    SimTexture *src = &m_bloomChain[0];
+    D3D11_TEXTURE2D_DESC srcDesc;
+    src->tex->GetDesc(&srcDesc);
+
+    FluidBloomParamsCB bp = {};
+    bp.intensity = kIntensity;
+    bp.texelSizeX = 1.0f / (float)srcDesc.Width;
+    bp.texelSizeY = 1.0f / (float)srcDesc.Height;
+    m_context->UpdateSubresource(m_cbBloomParams.Get(), 0, nullptr, &bp, 0, 0);
+    ID3D11Buffer *cb = m_cbBloomParams.Get();
+    m_context->CSSetConstantBuffers(3, 1, &cb);
+
+    ID3D11ShaderResourceView *srv = src->srv.Get();
+    m_context->CSSetShaderResources(11, 1, &srv);
+    ID3D11UnorderedAccessView *uav = m_bloom.uav.Get();
+    m_context->CSSetUnorderedAccessViews(7, 1, &uav, nullptr);
+    m_context->CSSetShader(m_csBloomFinal.Get(), nullptr, 0);
+    DispatchSim(m_bloomWidth, m_bloomHeight);
+    FluidUnbindCSUAVs(m_context, 7, 1);
+    FluidUnbindCSSRVs(m_context, 11, 1);
+  }
+}
+
+void FluidSimulation::RenderComposite(ID3D11RenderTargetView *rtv) {
+  ApplyBloom();
+
+  D3D11_VIEWPORT vp = {};
+  vp.Width = (FLOAT)m_screenWidth;
+  vp.Height = (FLOAT)m_screenHeight;
+  vp.MaxDepth = 1.0f;
+  m_context->RSSetViewports(1, &vp);
+
+  ID3D11RenderTargetView *rtvs[1] = {rtv};
+  m_context->OMSetRenderTargets(1, rtvs, nullptr);
+  m_context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+  m_context->OMSetDepthStencilState(nullptr, 0);
+  m_context->RSSetState(m_rasterizerState.Get());
+
+  const FLOAT clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  m_context->ClearRenderTargetView(rtv, clearColor);
+
+  m_context->IASetInputLayout(nullptr);
+  m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  m_context->VSSetShader(m_vsFullscreen.Get(), nullptr, 0);
+  m_context->PSSetShader(m_psComposite.Get(), nullptr, 0);
+
+  ID3D11ShaderResourceView *srvs[2] = {m_dye[m_dyeIdx].srv.Get(), m_bloom.srv.Get()};
+  m_context->PSSetShaderResources(13, 2, srvs);
+  ID3D11SamplerState *samp = m_sampler.Get();
+  m_context->PSSetSamplers(0, 1, &samp);
+
+  m_context->Draw(3, 0);
+
+  ID3D11ShaderResourceView *nullSrvs[2] = {nullptr, nullptr};
+  m_context->PSSetShaderResources(13, 2, nullSrvs);
+  ID3D11RenderTargetView *nullRtv = nullptr;
+  m_context->OMSetRenderTargets(1, &nullRtv, nullptr);
+}
+
+FluidSimulation::TickResult FluidSimulation::Tick(bool isOnBattery) {
+  if (!m_initialized)
+    return TickResult::Skipped;
+
+  if (IsEffectivePaused()) {
+    m_wasPausedLastTick = true;
+    return TickResult::Skipped;
+  }
+
+  // Just returned from a paused state (fullscreen app closed, session
+  // unlocked, or battery mode resumed). Queue a welcome-back burst so the
+  // wallpaper visibly "wakes up" instead of looking like a frozen frame
+  // from before the pause.
+  if (m_wasPausedLastTick) {
+    m_wasPausedLastTick = false;
+    m_pendingReturnSplats = true;
+  }
+
+  if (isOnBattery && g_batteryMode.load() == BatteryMode::DropFps) {
+    DWORD nowMs = GetTickCount();
+    if (m_lastDropFpsTickMs != 0 && nowMs - m_lastDropFpsTickMs < 66) {
+      return TickResult::Skipped;
+    }
+    m_lastDropFpsTickMs = nowMs;
+  }
+
+  {
+    DWORD nowMs = GetTickCount();
+    if (m_lastPressureResetTickMs == 0) {
+      m_lastPressureResetTickMs = nowMs;
+    } else if (nowMs - m_lastPressureResetTickMs > 25000) {
+      const FLOAT zero[4] = {0, 0, 0, 0};
+      m_context->ClearUnorderedAccessViewFloat(m_pressure[0].uav.Get(), zero);
+      m_context->ClearUnorderedAccessViewFloat(m_pressure[1].uav.Get(), zero);
+      m_lastPressureResetTickMs = nowMs;
+    }
+  }
+
+  LARGE_INTEGER freq;
+  QueryPerformanceFrequency(&freq);
+  LARGE_INTEGER now;
+  QueryPerformanceCounter(&now);
+  double dt = 1.0 / 60.0;
+  if (m_lastFrameTicks.QuadPart != 0 && freq.QuadPart > 0) {
+    dt = (double)(now.QuadPart - m_lastFrameTicks.QuadPart) / (double)freq.QuadPart;
+    dt = (std::min)(dt, 1.0 / 15.0);
+    dt = (std::max)(dt, 1.0 / 240.0);
+  }
+  m_lastFrameTicks = now;
+
+  Profiler::BeginFrame((DWORD)(++m_frameNumber));
+  Profiler::RecordTickCall();
+  Profiler::BeginSection("TransferVideoFrame");
+  UpdateSimulation((float)dt);
+  Profiler::EndSection("TransferVideoFrame");
+
+  ComPtr<ID3D11Texture2D> backBuffer;
+  HRESULT hr = m_swapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void **)&backBuffer);
+  if (FAILED(hr)) {
+    Profiler::EndFrame();
+    if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET)
+      return TickResult::DeviceLost;
+    return TickResult::Ok;
+  }
+
+  ID3D11RenderTargetView *rtv = nullptr;
+  for (int i = 0; i < 2; ++i) {
+    if (m_cachedBackBuffer[i].Get() == backBuffer.Get()) {
+      rtv = m_cachedBackBufferRtv[i].Get();
+      break;
+    }
+  }
+  if (!rtv) {
+    int slot = -1;
+    for (int i = 0; i < 2; ++i) {
+      if (!m_cachedBackBuffer[i].Get()) { slot = i; break; }
+    }
+    if (slot < 0) slot = 0;
+    m_cachedBackBuffer[slot] = backBuffer;
+    m_cachedBackBufferRtv[slot].Reset();
+    hr = m_device->CreateRenderTargetView(backBuffer.Get(), nullptr,
+                                          &m_cachedBackBufferRtv[slot]);
+    if (SUCCEEDED(hr))
+      rtv = m_cachedBackBufferRtv[slot].Get();
+  }
+
+  if (rtv) {
+    RenderComposite(rtv);
+  }
+
+  Profiler::DrawOverlay(m_hwnd, backBuffer.Get());
+
+  LARGE_INTEGER pStart, pEnd;
+  QueryPerformanceCounter(&pStart);
+  Profiler::BeginSection("Present");
+  // Present(0, 0) instead of Present(1, 0): the DWM composition schedule
+  // for a child-of-WorkerW window can throttle harder than the desktop's
+  // real refresh rate, and vsync-blocking on it was capping us well below
+  // the frame rate the render loop can actually produce.
+  hr = m_swapChain->Present(0, 0);
+  Profiler::EndSection("Present");
+  QueryPerformanceCounter(&pEnd);
+  double presentMs = (freq.QuadPart > 0)
+                         ? (double)(pEnd.QuadPart - pStart.QuadPart) * 1000.0 / (double)freq.QuadPart
+                         : 0.0;
+  Profiler::RecordPresent(hr, presentMs);
+  Profiler::EndFrame();
+
+  if (SUCCEEDED(hr)) {
+    if (!m_everShown && m_hwnd && !IsWindowVisible(m_hwnd)) {
+      ShowWindow(m_hwnd, SW_SHOWNOACTIVATE);
+      SetWindowPos(m_hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+      m_everShown = true;
+    }
+    return TickResult::Ok;
+  }
+  if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+    return TickResult::DeviceLost;
+  }
+  return TickResult::Ok;
 }
 
 // ---------------------------------------------------------------------------
@@ -2120,6 +3651,16 @@ struct VideoPlayer {
   }
 
   void UpdatePlaybackState() {
+    // In fluid mode, the shared kRenderTimerId is owned and driven by
+    // FluidSimulation, not this VideoPlayer. Every pause-state setter
+    // (fullscreen / battery / session) funnels through here, and the
+    // no-engine early-out below unconditionally calls KillTimer on that
+    // shared timer ID -- which would permanently freeze the fluid sim
+    // the first time any pause state changes. Bail out up front so
+    // FluidSimulation keeps receiving its Tick.
+    if (g_wallpaperMode.load() == WallpaperMode::Fluid) {
+      return;
+    }
     Wh_Log(L"VideoPlayer::UpdatePlaybackState: engine=%d canPlay=%d IsEffectivePaused=%d (fullscreen=%d, battery=%d, session=%d) wantsPlay=%d needsInitial=%d",
            engine.Get() != nullptr, canPlay ? 1 : 0, IsEffectivePaused() ? 1 : 0,
            pausedForFullscreen ? 1 : 0, pausedForBattery ? 1 : 0, pausedForSession ? 1 : 0, wantsPlay ? 1 : 0, needsInitialFrame ? 1 : 0);
@@ -2635,6 +4176,7 @@ struct VideoPlayer {
 };
 
 [[clang::no_destroy]] VideoPlayer g_player;
+[[clang::no_destroy]] FluidSimulation g_fluidSim;
 
 // ---------------------------------------------------------------------------
 // Window finding (unchanged from the working GIF build)
@@ -2769,6 +4311,7 @@ void PinBehindTargetWindow() {
         Wh_Log(L"PinBehindTargetWindow: host dimensions changed to %dx%d, resizing", w, h);
         SetWindowPos(g_wallpaperWnd, nullptr, 0, 0, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         g_player.Resize(w, h);
+        g_fluidSim.Resize(w, h);
       }
     }
   } else if (!g_topLevelMode && !GetParent(g_wallpaperWnd)) {
@@ -3049,8 +4592,10 @@ void CheckBatteryState() {
 
   if (g_batteryMode.load() == BatteryMode::Pause) {
     g_player.SetPausedForBattery(g_isOnBattery);
+    g_fluidSim.SetPausedForBattery(g_isOnBattery);
   } else {
     g_player.SetPausedForBattery(false);
+    g_fluidSim.SetPausedForBattery(false);
   }
 }
 
@@ -3072,6 +4617,7 @@ VOID CALLBACK WinEventProc(HWINEVENTHOOK hWinEventHook, DWORD event, HWND hwnd,
   if (event == EVENT_SYSTEM_FOREGROUND || event == EVENT_SYSTEM_MINIMIZEEND || event == EVENT_SYSTEM_MINIMIZESTART) {
     bool covered = IsDesktopFullyCovered(true);
     g_player.SetPausedForFullscreen(covered);
+    g_fluidSim.SetPausedForFullscreen(covered);
   }
 }
 
@@ -3100,12 +4646,21 @@ LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
   }
   case WM_TIMER: {
     if (wParam == kRenderTimerId) {
-      g_player.Tick(g_fitMode.load(), g_isOnBattery);
+      if (g_wallpaperMode.load() == WallpaperMode::Fluid) {
+        if (g_fluidSim.Tick(g_isOnBattery) == FluidSimulation::TickResult::DeviceLost) {
+          g_player.OnDeviceLost();
+        }
+      } else {
+        g_player.Tick(g_fitMode.load(), g_isOnBattery);
+      }
     } else if (wParam == kOcclusionTimerId) {
-      g_player.CheckLoadTimeout();
+      if (g_wallpaperMode.load() == WallpaperMode::Video) {
+        g_player.CheckLoadTimeout();
+      }
       CheckBatteryState();
       bool covered = IsDesktopFullyCovered();
       g_player.SetPausedForFullscreen(covered);
+      g_fluidSim.SetPausedForFullscreen(covered);
     } else if (wParam == kZOrderTimerId) {
       PinBehindTargetWindow();
     } else if (wParam == kSourceRetryTimerId) {
@@ -3182,6 +4737,7 @@ LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       SetWindowPos(hwnd, nullptr, vr.left, vr.top, w, h,
                    SWP_NOZORDER | SWP_NOACTIVATE);
       g_player.Resize(w, h);
+      g_fluidSim.Resize(w, h);
       PinBehindTargetWindow();
     } else {
       HWND parent = GetParent(hwnd);
@@ -3194,6 +4750,7 @@ LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
           SetWindowPos(hwnd, nullptr, 0, 0, w, h,
                        SWP_NOZORDER | SWP_NOACTIVATE);
           g_player.Resize(w, h);
+          g_fluidSim.Resize(w, h);
         }
       }
     }
@@ -3205,8 +4762,10 @@ LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
     Wh_Log(L"WallpaperWndProc: WM_WTSSESSION_CHANGE wParam=%lu", (unsigned long)wParam);
     if (wParam == WTS_SESSION_LOCK || wParam == WTS_REMOTE_CONNECT) {
       g_player.SetPausedForSession(true);
+      g_fluidSim.SetPausedForSession(true);
     } else if (wParam == WTS_SESSION_UNLOCK || wParam == WTS_REMOTE_DISCONNECT) {
       g_player.SetPausedForSession(false);
+      g_fluidSim.SetPausedForSession(false);
     }
     return 0;
   }
@@ -3346,6 +4905,40 @@ void ReloadWallpaperSource() {
   g_sourceRetryAttempts = 0;
   if (g_wallpaperWnd) {
     KillTimer(g_wallpaperWnd, kSourceRetryTimerId);
+  }
+}
+
+// Fluid-mode counterpart to ReloadWallpaperSource(). Handles both first-time
+// initialization and post-device-loss rebuild (g_player owns the shared D3D
+// device/swap chain regardless of mode, so its deviceLost flag is the signal).
+void ReloadFluidSource() {
+  Profiler::RecordEvent(L"Reload");
+  if (!g_wallpaperWnd)
+    return;
+
+  if (g_player.deviceLost || !g_player.d3dDevice.Get()) {
+    Wh_Log(L"ReloadFluidSource: shared device lost or missing, rebuilding");
+    HWND hwnd = g_wallpaperWnd;
+    int w = g_player.width, h = g_player.height;
+    g_fluidSim.Shutdown();
+    g_player.Shutdown();
+    if (!g_player.InitD3DAndSwapChain(hwnd, w, h)) {
+      Wh_Log(L"ReloadFluidSource: failed to rebuild shared D3D device/swap chain");
+      if (IsWindowVisible(hwnd))
+        ShowWindow(hwnd, SW_HIDE);
+      return;
+    }
+  }
+
+  if (!g_fluidSim.IsInitialized()) {
+    if (!g_fluidSim.Initialize(g_player.d3dDevice.Get(), g_player.d3dContext.Get(),
+                               g_player.swapChain.Get(), g_wallpaperWnd, g_player.width,
+                               g_player.height)) {
+      Wh_Log(L"ReloadFluidSource: FluidSimulation::Initialize failed");
+      if (g_wallpaperWnd && IsWindowVisible(g_wallpaperWnd)) {
+        ShowWindow(g_wallpaperWnd, SW_HIDE);
+      }
+    }
   }
 }
 
@@ -3516,9 +5109,9 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
   }
   SetTimer(g_wallpaperWnd, kZOrderTimerId, 1000, nullptr);
 
-  if (!g_player.InitD3DAndSwapChain(g_wallpaperWnd, width, height) ||
-      !g_player.InitMediaEngine(g_wallpaperWnd)) {
-    Wh_Log(L"WallpaperThreadProc: video player init failed");
+  bool sharedDeviceOk = g_player.InitD3DAndSwapChain(g_wallpaperWnd, width, height);
+  if (!sharedDeviceOk) {
+    Wh_Log(L"WallpaperThreadProc: shared D3D device/swap chain init failed");
     if (g_wallpaperWnd && IsWindowVisible(g_wallpaperWnd)) {
       ShowWindow(g_wallpaperWnd, SW_HIDE);
     }
@@ -3538,7 +5131,16 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
 
   RegisterConfiguredHotkeys();
 
-  ReloadWallpaperSource();
+  if (sharedDeviceOk) {
+    if (g_wallpaperMode.load() == WallpaperMode::Fluid) {
+      ReloadFluidSource();
+    } else {
+      if (!g_player.InitMediaEngine(g_wallpaperWnd)) {
+        Wh_Log(L"WallpaperThreadProc: InitMediaEngine failed");
+      }
+      ReloadWallpaperSource();
+    }
+  }
 
   if (WaitForSingleObject(g_shutdownEvent, 0) == WAIT_OBJECT_0)
     PostQuitMessage(0);
@@ -3547,19 +5149,56 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
     if (msg.message == kMsgReloadSource) {
       g_sourceRetryAttempts = 0;
-      ReloadWallpaperSource();
+      if (g_wallpaperMode.load() == WallpaperMode::Fluid) {
+        ReloadFluidSource();
+      } else {
+        ReloadWallpaperSource();
+      }
+      continue;
+    }
+    if (msg.message == kMsgModeChanged) {
+      Wh_Log(L"WallpaperThreadProc: wallpaper mode changed to %s",
+             g_wallpaperMode.load() == WallpaperMode::Fluid ? L"fluid" : L"video");
+      HWND hwnd = g_wallpaperWnd;
+      int w = g_player.width, h = g_player.height;
+      g_fluidSim.Shutdown();
+      g_player.Shutdown();
+      if (!hwnd || !g_player.InitD3DAndSwapChain(hwnd, w, h)) {
+        Wh_Log(L"WallpaperThreadProc: failed to rebuild shared device after mode change");
+        if (hwnd && IsWindowVisible(hwnd))
+          ShowWindow(hwnd, SW_HIDE);
+        continue;
+      }
+      if (g_wallpaperMode.load() == WallpaperMode::Fluid) {
+        if (!g_fluidSim.Initialize(g_player.d3dDevice.Get(), g_player.d3dContext.Get(),
+                                   g_player.swapChain.Get(), hwnd, w, h)) {
+          Wh_Log(L"WallpaperThreadProc: FluidSimulation init failed after mode change");
+        }
+      } else {
+        if (!g_player.InitMediaEngine(hwnd)) {
+          Wh_Log(L"WallpaperThreadProc: InitMediaEngine failed after mode change");
+        } else {
+          ReloadWallpaperSource();
+        }
+      }
       continue;
     }
     if (msg.message == kMsgUpdateSettings) {
       RegisterConfiguredHotkeys();
       if (g_wallpaperWnd) {
         SetTimer(g_wallpaperWnd, kOcclusionTimerId, g_occlusionIntervalMs.load(), nullptr);
+        if (g_wallpaperMode.load() == WallpaperMode::Fluid) {
+          SetTimer(g_wallpaperWnd, kRenderTimerId,
+                   VideoPlayer::GetMonitorRefreshIntervalMs(), nullptr);
+        }
       }
-      if (g_player.engine.Get()) {
-        g_player.engine->SetMuted(g_audioMuted.load() ? TRUE : FALSE);
-        g_player.engine->SetVolume(static_cast<double>(g_audioVolume.load()) / 100.0);
+      if (g_wallpaperMode.load() == WallpaperMode::Video) {
+        if (g_player.engine.Get()) {
+          g_player.engine->SetMuted(g_audioMuted.load() ? TRUE : FALSE);
+          g_player.engine->SetVolume(static_cast<double>(g_audioVolume.load()) / 100.0);
+        }
+        g_player.UpdatePlaybackState();
       }
-      g_player.UpdatePlaybackState();
       continue;
     }
     TranslateMessage(&msg);
@@ -3568,6 +5207,7 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
 
   Wh_Log(L"WallpaperThreadProc: message loop exiting");
 
+  g_fluidSim.Shutdown();
   g_player.Shutdown();
 
   if (g_wallpaperWnd) {
@@ -3647,10 +5287,14 @@ void Wh_ModUninit() {
 
 void Wh_ModSettingsChanged() {
   Wh_Log(L"SettingsChanged");
+  WallpaperMode oldMode = g_wallpaperMode.load();
   std::wstring oldPath = LoadSettings();
+  WallpaperMode newMode = g_wallpaperMode.load();
   std::wstring newPath = GetVideoPathSetting();
   if (g_threadId) {
-    if (newPath != oldPath) {
+    if (newMode != oldMode) {
+      PostThreadMessageW(g_threadId, kMsgModeChanged, 0, 0);
+    } else if (newMode == WallpaperMode::Video && newPath != oldPath) {
       PostThreadMessageW(g_threadId, kMsgReloadSource, 0, 0);
     } else {
       PostThreadMessageW(g_threadId, kMsgUpdateSettings, 0, 0);

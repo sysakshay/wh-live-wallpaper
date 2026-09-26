@@ -29,7 +29,7 @@ Unlike traditional animated wallpaper applications that consume heavy background
 * 🛡️ **Smart Occlusion Detection:** Automatically detects when full-screen applications or maximized windows cover your desktop (`P95` CPU check < 0.1 ms) and pauses rendering to free up 100% of GPU resources for gaming and productivity.
 * 🔋 **Battery-Aware Power Saving:** Automatically adapts when running on laptop battery power—choose whether to pause completely, throttle to 15 FPS, or continue normal playback.
 * ⚡ **Instant First-Frame Presentation:** Decodes and presents the initial video frame immediately upon loading so your desktop never gets stuck on a black screen.
-* 🎨 **Flexible Scaling:** Support for both **Fill** (stretch/zoom to cover screen) and **Fit** (letterbox with cinema-style black bars).
+* 🎨 **Flexible Scaling:** Choose Fill, Cover, or Fit, and either span one video across all screens or show the same video on each screen.
 * 🛠️ **Auto-Recovery:** Built-in resilience against D3D device-loss events (`DXGI_ERROR_DEVICE_REMOVED`) and Media Foundation decode stalls.
 
 ---
@@ -61,7 +61,7 @@ There are two easy ways to pick your video:
 | Hotkey | Action | Description |
 | :--- | :--- | :--- |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>G</kbd> | **📂 Open File Picker** | Instantly open an interactive Windows file dialog to pick and load a new `.mp4` video without leaving the desktop. |
-| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>H</kbd> | **👁️ Toggle Visibility** | Show or hide the video wallpaper on demand. |
+| <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>H</kbd> | **👁️ Toggle Visibility** | Hide and pause the video and its audio, or show and resume them. |
 | <kbd>Ctrl</kbd> + <kbd>Alt</kbd> + <kbd>D</kbd> | **📊 Toggle Profiler HUD** | Show or hide the diagnostics overlay after enabling its hotkey in settings. |
 
 ---
@@ -85,7 +85,11 @@ In the Windhawk **Settings** tab for this mod, you can customize the following o
 * **Local video path (`videoPath`):** Full file path to any `.mp4` file on your disk.
 * **Fit mode (`fitMode`):**
   * `fill`: Scale and stretch the video to fill the entire monitor.
+  * `cover`: Fill the screen without stretching; crop edges when needed.
   * `fit`: Letterbox the video while preserving its original aspect ratio.
+* **Display layout (`displayLayout`):**
+  * `span` (default): One continuous video across all monitors. Best for videos made for the combined screen size.
+  * `clone`: Show the same video on each monitor. Choose `cover` to fill each screen without stretching, or `fit` to show the whole video with possible borders.
 * **Battery saving mode (`batteryMode`):**
   * `pause`: Stop video rendering completely when unplugged from AC power (maximum battery savings).
   * `drop`: Reduce target frame rate to 15 FPS while on battery.

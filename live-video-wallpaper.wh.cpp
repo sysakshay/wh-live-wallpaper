@@ -93,7 +93,7 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
   $description: Master switch -- what to render as your desktop wallpaper.
   $options:
   - video: Video (play an MP4 file)
-  - fluid: Fluid Simulation (experimental, interactive)
+  - fluid: Fluid Simulation (By WasiXGamer)
 - videoPath: ""
   $name: Local video path
   $description: Full path to an .mp4 file on disk. Tip -- press Ctrl+Alt+G in the desktop to pick a file interactively instead of typing a path here.
@@ -162,7 +162,7 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
 - fluidColorful: true
   $name: Fluid - Colorful
   $description: When on, splats use random vivid hues. When off, splats use a fixed cyan color.
-- fluidRandomSplatsInterval: 3
+- fluidRandomSplatsInterval: 2
   $name: Fluid - Random splats interval (seconds)
   $description: How often random ambient splats appear, in seconds (0 = disabled).
 */
@@ -1566,7 +1566,7 @@ std::atomic<int>  g_fluidSplatRadius{25};          // 0-100
 std::atomic<int>  g_fluidSpeed{100};               // 0-200
 std::atomic<int>  g_fluidBloom{80};                // 0-200
 std::atomic<bool> g_fluidColorful{true};
-std::atomic<int>  g_fluidRandomSplatsInterval{3};  // seconds, 0 = disabled
+std::atomic<int>  g_fluidRandomSplatsInterval{2};  // seconds, 0 = disabled
 std::atomic<int> g_targetFps{60};
 std::atomic<bool> g_audioMuted{true};
 std::atomic<int> g_audioVolume{100};
@@ -2307,6 +2307,8 @@ private:
   bool m_pausedForSession = false;
   bool m_everShown = false;
   DWORD m_lastDropFpsTickMs = 0;
+  bool m_wasPausedLastTick = false;
+  bool m_pendingReturnSplats = false;
 };
 
 void FluidSimulation::ComputeResolutions(int screenW, int screenH) {
@@ -2684,6 +2686,32 @@ void FluidSimulation::UpdateSimulation(float dt) {
   bool cornerSplatsEnabled = (randomIntervalSec > 0);
   const float kSplatRadiusUVBase = 0.0025f * radiusScale;
 
+  // Welcome-back burst: fired once per pause->unpause cycle. Slightly
+  // larger and force-driven than the periodic ambient splats so the
+  // display clearly reacts to being visible again. Also resets the
+  // interval timer so we don't double-burst back-to-back.
+  if (m_pendingReturnSplats) {
+    m_pendingReturnSplats = false;
+    int count = 10 + (rand() % 6);
+    for (int i = 0; i < count; ++i) {
+      float r, g, b;
+      ComputeSplatColor(r, g, b);
+
+      float px = (float)rand() / (float)RAND_MAX;
+      float py = (float)rand() / (float)RAND_MAX;
+      float dx = 1500.0f * ((float)rand() / (float)RAND_MAX - 0.5f);
+      float dy = 1500.0f * ((float)rand() / (float)RAND_MAX - 0.5f);
+
+      float radiusUV = kSplatRadiusUVBase;
+      if (m_screenWidth > m_screenHeight)
+        radiusUV *= (float)m_screenWidth / (float)m_screenHeight;
+
+      DoSplatVelocity(px, py, dx, dy, radiusUV);
+      DoSplatDye(px, py, r * 10.0f, g * 10.0f, b * 10.0f, radiusUV);
+    }
+    m_lastCornerSplatTickMs = GetTickCount();
+  }
+
   if (!g_fluidColorful.load()) {
     m_cursorColorR = 0.2f; m_cursorColorG = 0.8f; m_cursorColorB = 1.0f;
     m_cursorColorValid = true;
@@ -3040,8 +3068,20 @@ void FluidSimulation::RenderComposite(ID3D11RenderTargetView *rtv) {
 FluidSimulation::TickResult FluidSimulation::Tick(bool isOnBattery) {
   if (!m_initialized)
     return TickResult::Skipped;
-  if (IsEffectivePaused())
+
+  if (IsEffectivePaused()) {
+    m_wasPausedLastTick = true;
     return TickResult::Skipped;
+  }
+
+  // Just returned from a paused state (fullscreen app closed, session
+  // unlocked, or battery mode resumed). Queue a welcome-back burst so the
+  // wallpaper visibly "wakes up" instead of looking like a frozen frame
+  // from before the pause.
+  if (m_wasPausedLastTick) {
+    m_wasPausedLastTick = false;
+    m_pendingReturnSplats = true;
+  }
 
   if (isOnBattery && g_batteryMode.load() == BatteryMode::DropFps) {
     DWORD nowMs = GetTickCount();

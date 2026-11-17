@@ -26,7 +26,7 @@
 Unlike traditional animated wallpaper applications that consume heavy background CPU and memory, **Live Video Wallpaper** integrates directly into `explorer.exe` via [Windhawk](https://windhawk.net/). By utilizing **Windows Media Foundation** and **Direct3D 11**, it decodes and renders video frames completely on the GPU:
 
 * 🚀 **Zero-Copy GPU Rendering:** Video frames are decoded directly to Direct3D 11 offscreen targets and presented using flip-model swap chains (`DXGI_SWAP_EFFECT_FLIP_DISCARD`) for tear-free, crystal-clear 60 FPS playback.
-* 🛡️ **Smart Occlusion Detection:** Automatically detects when full-screen applications or maximized windows cover your desktop (`P95` CPU check < 0.1 ms) and pauses rendering to free up 100% of GPU resources for gaming and productivity.
+* 🛡️ **Smart Occlusion Detection:** Pauses rendering when every monitor is covered by an app, while keeping playback active on uncovered screens (`P95` CPU check < 0.1 ms).
 * 🔋 **Battery-Aware Power Saving:** Automatically adapts when running on laptop battery power—choose whether to pause completely, throttle to 15 FPS, or continue normal playback.
 * ⚡ **Instant First-Frame Presentation:** Decodes and presents the initial video frame immediately upon loading so your desktop never gets stuck on a black screen.
 * 🎨 **Flexible Scaling:** Choose Fill, Cover, or Fit, and either span one video across all screens or show the same video on each screen.
@@ -97,7 +97,7 @@ In the Windhawk **Settings** tab for this mod, you can customize the following o
 * **Target frame rate (`targetFps`):** Choose between `monitor` (sync exactly with display V-Sync refresh rate), `60`, `30`, or `15` FPS.
 * **Mute audio output (`audioMuted`):** Whether to mute audio tracks embedded in your video files (`true` by default).
 * **Audio volume (`audioVolume`):** Audio output volume percentage from `0` to `100` (`100` by default).
-* **Hotkeys:** Enable or disable the file picker, visibility, and profiler hotkeys independently. The profiler hotkey is disabled by default.
+* **Hotkeys:** Enable or disable `Ctrl+Alt+G` (file picker, on by default), `Ctrl+Alt+H` (visibility, on by default), and `Ctrl+Alt+D` (profiler, off by default) independently.
 
 ---
 

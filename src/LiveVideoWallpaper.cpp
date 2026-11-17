@@ -27,7 +27,7 @@ playback.
 
 - **Hardware-Accelerated Playback:** Direct3D 11 rendering and Windows Media Foundation zero-copy video decoding directly onto the desktop window hierarchy.
 - **Built-in Performance Profiler (`Ctrl + Alt + D`):** Live HUD overlay displaying true wall-clock FPS, frame-time percentiles (`P95`/`P99`), VRAM/commit stats, and pipeline stage timings (`Decode`, `Transfer`, `Present`).
-- **Smart Occlusion Detection:** Automatically pauses video rendering when top-level or maximized application windows fully cover the desktop (`P95` CPU occlusion check < 0.1ms). Uses zero-latency `EVENT_SYSTEM_FOREGROUND` event hooks.
+- **Smart Occlusion Detection:** Pauses rendering when every monitor is covered by an app, while keeping playback active on uncovered screens (`P95` CPU occlusion check < 0.1ms). Uses `EVENT_SYSTEM_FOREGROUND` notifications plus a configurable safety check.
 - **Audio Volume Control & Stream Restoration:** Integrated audio volume control (`0%` to `100%`) with automatic unmuting and volume restoration when resuming playback or switching apps.
 - **Battery-Aware Power Saving:** Configurable behavior (`Pause`, `Drop to 15 FPS`, or `Play normally`) when running on laptop battery power.
 - **Instant First-Frame Presentation:** Decodes and presents the initial video frame immediately upon loading so the wallpaper never gets stuck on a black screen when starting in paused/battery mode.
@@ -39,9 +39,9 @@ playback.
 
 ## Controls & Hotkeys
 
-- **`Ctrl + Alt + G`** — Open the interactive file picker to load a new video (`.mp4`, `.m4v`, `.mov`, `.wmv`, `.webm`).
-- **`Ctrl + Alt + H`** — Hide and pause the wallpaper and its audio, or show and resume them.
-- **`Ctrl + Alt + D`** — Toggle Performance Profiler HUD (On / Off), if enabled in settings.
+- **`Ctrl + Alt + G`** — Open the interactive file picker to load a new video (`.mp4`, `.m4v`, `.mov`, `.wmv`, `.webm`). Enabled by default.
+- **`Ctrl + Alt + H`** — Hide and pause the wallpaper and its audio, or show and resume them. Enabled by default.
+- **`Ctrl + Alt + D`** — Toggle Performance Profiler HUD (On / Off). Disabled by default; enable it in settings.
 
 ## Performance Profiler HUD
 
@@ -60,6 +60,10 @@ Full path to any local video file on your disk. Can also be updated dynamically 
 - **Fill:** Stretch/scale video to fill the entire monitor.
 - **Cover:** Zoom and crop video edges to fill screen without aspect ratio distortion.
 - **Fit:** Letterbox video while preserving original aspect ratio.
+
+### Display Layout
+- **Span all screens:** Show one continuous video across the combined desktop area. Choose this for videos made for a multi-monitor layout.
+- **Same video on each screen:** Draw the same video independently on each monitor. Pair with **Cover** to fill each screen without stretching, or **Fit** to show the full frame with possible borders.
 
 ### Battery Saving Mode
 - **Pause video (maximum battery life):** Stops video processing completely when unplugged from AC power.
@@ -80,7 +84,7 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
 
 - **Zero-Copy Offscreen Target:** Decodes to an offscreen `B8G8R8A8_UNORM` render target before copying to the flip-model swap chain (`DXGI_SWAP_EFFECT_FLIP_DISCARD`) to guarantee tear-free presentation without MF timing conflicts.
 - **DXGI Flip-Model RTV Caching:** Caches D3D11 render target views while handling DXGI swap-chain buffer rotation in `Fit` mode.
-- **Zero Heap Allocations:** Ring buffer percentile calculations use zero-allocation stack buffers at 60 Hz.
+- **Allocation-Free Profiler Stats:** Ring buffer percentile calculations use stack buffers at 60 Hz.
 - **$O(1)$ Section Timers:** Profiler queries bypass linear string comparisons via pooled pointer-equality checks inside hot rendering loops.
 - **Kernel Resource Caching:** GDI font handles (`HFONT`), desktop region guards (`HRGN`), and WorkerW window handles are cached across frames to eliminate handle churn.
 - **Fast Occlusion Screening:** Bounding-box intersection screening skips invisible, borderless system helpers, and non-overlapping windows before querying DWM or class attributes.
@@ -102,7 +106,7 @@ Frequency of background occlusion safety-net polling (`fast`: 100ms, `normal`: 2
   - fit: Fit (letterbox with aspect ratio preserved and black borders)
 - displayLayout: span
   $name: Display layout
-  $description: Span one video across all screens, or show the same video on each screen.
+  $description: Span one video across all screens, or show the same video on each screen. Clone with Cover fills each screen without stretching, but crops edges when needed.
   $options:
   - span: Span all screens (one continuous video)
   - clone: Same video on each screen
@@ -501,11 +505,39 @@ struct VideoPlayer {
 
   int width = 0;
   int height = 0;
+  std::vector<RECT> displayRects;
+  bool displayRectsHaveGaps = true;
+
+  void RefreshDisplayRects() {
+    displayRects.clear();
+    if (!boundHwnd || !g_cloneDisplays.load()) {
+      displayRects.push_back({0, 0, width, height});
+      displayRectsHaveGaps = false;
+      return;
+    }
+
+    POINT origin = {0, 0};
+    ClientToScreen(boundHwnd, &origin);
+    MonitorRects data{&displayRects, origin, width, height};
+    EnumDisplayMonitors(nullptr, nullptr, MonitorRects::Collect,
+                        reinterpret_cast<LPARAM>(&data));
+    if (displayRects.empty())
+      displayRects.push_back({0, 0, width, height});
+
+    LONGLONG monitorArea = 0;
+    for (const RECT& rect : displayRects) {
+      monitorArea += static_cast<LONGLONG>(rect.right - rect.left) *
+                     static_cast<LONGLONG>(rect.bottom - rect.top);
+    }
+    LONGLONG surfaceArea = static_cast<LONGLONG>(width) * height;
+    displayRectsHaveGaps = monitorArea < surfaceArea;
+  }
 
   bool InitD3DAndSwapChain(HWND hwnd, int w, int h) {
     boundHwnd = hwnd;
     width = w;
     height = h;
+    RefreshDisplayRects();
 
     // VIDEO_SUPPORT: required for the device to be usable for hardware
     // video decode/processing at all -- without it, Media Foundation
@@ -966,6 +998,7 @@ struct VideoPlayer {
       return;
     width = w;
     height = h;
+    RefreshDisplayRects();
     destRectValid = false;
     ResetRTVs();
     HRESULT hr =
@@ -1186,19 +1219,6 @@ struct VideoPlayer {
     RECT spanDest;
     ComputeDestRect(spanDest, fitMode);
 
-    // Monitor rectangles are converted from screen to wallpaper-client coordinates.
-    // Enumerate here so hot-plugging, rearranging, and WorkerW reparenting all
-    // take effect without restarting the video.
-    std::vector<RECT> displayRects;
-    if (g_cloneDisplays.load() && boundHwnd) {
-      POINT origin = {0, 0};
-      ClientToScreen(boundHwnd, &origin);
-      MonitorRects data{&displayRects, origin, width, height};
-      EnumDisplayMonitors(nullptr, nullptr, MonitorRects::Collect,
-                          reinterpret_cast<LPARAM>(&data));
-    }
-    if (displayRects.empty())
-      displayRects.push_back({0, 0, width, height});
     bool clone = g_cloneDisplays.load() && displayRects.size() > 1;
 
     ComPtr<ID3D11Texture2D> backBuffer;
@@ -1213,7 +1233,7 @@ struct VideoPlayer {
 
     // Fit leaves letterbox borders; clone can also leave gaps between monitors.
     // Clear those areas before drawing the current frame.
-    if (fitMode == 2 || clone) {
+    if (fitMode == 2 || (clone && displayRectsHaveGaps)) {
       ClearTexture(backBuffer.Get());
       if (renderTarget.Get()) {
         ClearTexture(renderTarget.Get());
@@ -1554,6 +1574,7 @@ void PinBehindTargetWindow() {
   // Always keep at the bottom of the Z-order (both inside WorkerW and in top-level mode)
   SetWindowPos(g_wallpaperWnd, HWND_BOTTOM, 0, 0, 0, 0,
                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW);
+  g_player.RefreshDisplayRects();
 
   // If rendering is active and canPlay is true, make sure our window hasn't been hidden
   // by Explorer during startup/theme transition.
@@ -1564,7 +1585,7 @@ void PinBehindTargetWindow() {
 }
 
 // ---------------------------------------------------------------------------
-// Fullscreen-pause heuristic (unchanged)
+// Multi-monitor-aware fullscreen pause detection
 // ---------------------------------------------------------------------------
 
 // RAII guard for GDI HRGN handles -- ensures DeleteObject is called on
@@ -1579,6 +1600,14 @@ struct HRGNGuard {
   // Non-copyable.
   HRGNGuard(const HRGNGuard &) = delete;
   HRGNGuard &operator=(const HRGNGuard &) = delete;
+};
+
+struct ScreenMonitorRects {
+  std::vector<RECT> rects;
+  static BOOL CALLBACK Collect(HMONITOR, HDC, LPRECT monitor, LPARAM param) {
+    reinterpret_cast<ScreenMonitorRects*>(param)->rects.push_back(*monitor);
+    return TRUE;
+  }
 };
 
 bool IsDesktopFullyCovered(bool forceCheck = false) {
@@ -1612,6 +1641,7 @@ bool IsDesktopFullyCovered(bool forceCheck = false) {
 
   HRGNGuard uncoveredGuard;
   HWND hwnd = GetTopWindow(nullptr);
+  HWND foreground = GetAncestor(GetForegroundWindow(), GA_ROOT);
   while (hwnd) {
     // Fast O(1) stop conditions: our own window, direct parent, or known
     // desktop host
@@ -1708,34 +1738,6 @@ bool IsDesktopFullyCovered(bool forceCheck = false) {
       }
     }
 
-    // Fullscreen browser videos are usually borderless windows. If the
-    // foreground app covers an entire monitor, pause playback even when its
-    // window has no caption or thick frame. This also handles a fullscreen
-    // video on just one monitor of a multi-monitor desktop.
-    HWND foreground = GetForegroundWindow();
-    if (foreground && hwnd == GetAncestor(foreground, GA_ROOT) &&
-        hwnd != GetDesktopWindow()) {
-      HMONITOR monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-      MONITORINFO mi = {sizeof(mi)};
-      if (GetMonitorInfoW(monitor, &mi) &&
-          wr.left <= mi.rcMonitor.left + 4 &&
-          wr.top <= mi.rcMonitor.top + 4 &&
-          wr.right >= mi.rcMonitor.right - 4 &&
-          wr.bottom >= mi.rcMonitor.bottom - 4) {
-        cachedResult = true;
-        return true;
-      }
-    }
-
-    // Borderless windows without WS_CAPTION/WS_THICKFRAME that are NOT explicit
-    // taskbar app windows (WS_EX_APPWINDOW) are modern composition/overlay
-    // helpers or desktop backdrop hosts, not occluding applications.
-    if (!(style & WS_CAPTION) && !(style & WS_THICKFRAME) &&
-        !(exStyle & WS_EX_APPWINDOW)) {
-      hwnd = GetWindow(hwnd, GW_HWNDNEXT);
-      continue;
-    }
-
     // Refine to true visible bounds (excluding invisible DWM drop shadows
     // around normal windows)
     if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &wr,
@@ -1754,6 +1756,32 @@ bool IsDesktopFullyCovered(bool forceCheck = false) {
       if (GetMonitorInfoW(mon, &mi)) {
         wr = mi.rcMonitor;
       }
+    }
+
+    // Borderless browser fullscreen has no caption or thick frame, so detect
+    // it from the foreground window's visible bounds. Add its monitor to the
+    // covered region below instead of declaring the entire desktop covered.
+    bool foregroundFullscreen = false;
+    if (foreground && hwnd == foreground && hwnd != GetDesktopWindow()) {
+      HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+      MONITORINFO mi = {sizeof(mi)};
+      if (GetMonitorInfoW(mon, &mi) &&
+          wr.left <= mi.rcMonitor.left + 4 &&
+          wr.top <= mi.rcMonitor.top + 4 &&
+          wr.right >= mi.rcMonitor.right - 4 &&
+          wr.bottom >= mi.rcMonitor.bottom - 4) {
+        wr = mi.rcMonitor;
+        foregroundFullscreen = true;
+      }
+    }
+
+    // Borderless windows without WS_CAPTION/WS_THICKFRAME that are NOT
+    // fullscreen foreground apps or explicit taskbar app windows are helper
+    // and overlay windows, not desktop occluders.
+    if (!foregroundFullscreen && !(style & WS_CAPTION) &&
+        !(style & WS_THICKFRAME) && !(exStyle & WS_EX_APPWINDOW)) {
+      hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+      continue;
     }
 
     // Fast-path check: if this single window completely covers our target rect
@@ -1786,27 +1814,54 @@ bool IsDesktopFullyCovered(bool forceCheck = false) {
         DeleteObject(hrgnWnd);
       }
 
-      RECT rcBox = {};
-      int rgnType = GetRgnBox(uncoveredGuard.h, &rcBox);
-      LONGLONG remainingArea = static_cast<LONGLONG>(rcBox.right - rcBox.left) *
-                               static_cast<LONGLONG>(rcBox.bottom - rcBox.top);
-      LONGLONG totalArea = static_cast<LONGLONG>(rcTarget.right - rcTarget.left) *
-                           static_cast<LONGLONG>(rcTarget.bottom - rcTarget.top);
-      if (rgnType == NULLREGION || IsRectEmpty(&rcBox) ||
-          (rcBox.right - rcBox.left <= 4 || rcBox.bottom - rcBox.top <= 4) ||
-          (totalArea > 0 && remainingArea < (totalArea / 10))) {
-        if (!cachedResult) {
-          wchar_t title[128] = {};
-          GetWindowTextW(hwnd, title, ARRAYSIZE(title));
-          Wh_Log(L"IsDesktopFullyCovered: covered (rgn-box/partial >90%%) by hwnd=0x%p class='%s' title='%s'",
-                 hwnd, className, title);
-        }
-        cachedResult = true;
-        return true;
-      }
     }
 
     hwnd = GetWindow(hwnd, GW_HWNDNEXT);
+  }
+
+  // Pause only after every monitor that intersects the wallpaper surface is
+  // covered. A fullscreen app on one screen must not pause videos on the others.
+  if (uncoveredGuard.h) {
+    ScreenMonitorRects monitors;
+    EnumDisplayMonitors(nullptr, nullptr, ScreenMonitorRects::Collect,
+                        reinterpret_cast<LPARAM>(&monitors));
+    bool foundMonitor = false;
+    bool allMonitorsCovered = true;
+    for (const RECT& monitor : monitors.rects) {
+      RECT visibleMonitor = {};
+      if (!IntersectRect(&visibleMonitor, &monitor, &rcTarget))
+        continue;
+      foundMonitor = true;
+      HRGN monitorRegion = CreateRectRgnIndirect(&visibleMonitor);
+      HRGN uncoveredMonitor = CreateRectRgn(0, 0, 0, 0);
+      if (!monitorRegion || !uncoveredMonitor ||
+          CombineRgn(uncoveredMonitor, uncoveredGuard.h, monitorRegion,
+                     RGN_AND) == ERROR) {
+        allMonitorsCovered = false;
+      } else {
+        RECT uncoveredBounds = {};
+        int regionType = GetRgnBox(uncoveredMonitor, &uncoveredBounds);
+        LONGLONG remainingArea = static_cast<LONGLONG>(uncoveredBounds.right - uncoveredBounds.left) *
+                                 static_cast<LONGLONG>(uncoveredBounds.bottom - uncoveredBounds.top);
+        LONGLONG monitorArea = static_cast<LONGLONG>(visibleMonitor.right - visibleMonitor.left) *
+                               static_cast<LONGLONG>(visibleMonitor.bottom - visibleMonitor.top);
+        if (regionType == ERROR ||
+            (regionType != NULLREGION &&
+             (uncoveredBounds.right - uncoveredBounds.left <= 4 ||
+              uncoveredBounds.bottom - uncoveredBounds.top <= 4 ||
+              (monitorArea > 0 && remainingArea >= monitorArea / 10)))) {
+          allMonitorsCovered = false;
+        }
+      }
+      if (monitorRegion)
+        DeleteObject(monitorRegion);
+      if (uncoveredMonitor)
+        DeleteObject(uncoveredMonitor);
+      if (!allMonitorsCovered)
+        break;
+    }
+    cachedResult = foundMonitor && allMonitorsCovered;
+    return cachedResult;
   }
 
   // uncoveredGuard's destructor handles DeleteObject automatically.
@@ -1990,6 +2045,7 @@ LRESULT CALLBACK WallpaperWndProc(HWND hwnd, UINT msg, WPARAM wParam,
       }
     }
 
+    g_player.RefreshDisplayRects();
     g_player.OnSystemResume();
     return 0;
   }
@@ -2343,6 +2399,7 @@ DWORD WINAPI WallpaperThreadProc(LPVOID) {
     }
     if (msg.message == kMsgUpdateSettings) {
       RegisterConfiguredHotkeys();
+      g_player.RefreshDisplayRects();
       if (g_wallpaperWnd) {
         SetTimer(g_wallpaperWnd, kOcclusionTimerId, g_occlusionIntervalMs.load(), nullptr);
       }
